@@ -1,4 +1,4 @@
-# Telegram YT-DLP Bot (MAX quality + archive every 10)
+# Telegram YT-DLP Bot — MAX quality + archive every 10 videos
 # Use only for content you are allowed to download.
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ import yt_dlp
 from yt_dlp.utils import DownloadError
 
 # ---------------- configuration ----------------
-BATCH_SIZE = 10         # archive each N videos in /getall
-DEFAULT_HEIGHT = 0      # 0 => MAX available quality by default
+BATCH_SIZE = 10         # /getall: make a ZIP after every N downloaded videos
+DEFAULT_HEIGHT = 0      # 0 => MAX quality by default
 ALLOWED_NETLOC = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
 # ------------------------------------------------
 
@@ -36,16 +36,15 @@ if not BOT_TOKEN:
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-# Guide text (avoid multiline literals)
+# Guide text (small, no multiline literals inside handlers)
 GUIDE_TEXT = "".join([
-    "<b>YT‑DLP Telegram Bot — Guide</b>",
+    "<b>YT-DLP Telegram Bot — Guide</b>",
     "",
     "<b>Commands</b>",
     "/get <url> [video|audio] [360|480|720|1080|max]",
     "/getall <channel_or_playlist_url> [video|audio] [360|480|720|1080|max]",
     "",
-    "По умолчанию качество: MAX. В /getall бот архивирует каждые 10 видео (без ограничений по размеру).",
-    "Используйте только контент, на который у вас есть права.",
+    "Default quality: MAX. In /getall the bot archives every 10 videos (no size checks).",
 ])
 
 YTDLP_COMMON: Dict[str, object] = {
@@ -54,7 +53,7 @@ YTDLP_COMMON: Dict[str, object] = {
     "quiet": True,
     "no_warnings": True,
     "concurrent_fragment_downloads": 5,
-    # headers + extractor args help avoid some 403 / format issues
+    # Headers and extractor args reduce 403 and format issues
     "http_headers": {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
@@ -66,7 +65,6 @@ YTDLP_COMMON: Dict[str, object] = {
         }
     },
 }
-
 
 @dataclass
 class DLResult:
@@ -98,7 +96,7 @@ def _build_format_string(mode: str, height: int) -> str:
         return "ba/bestaudio/best"
     # video
     if height and height > 0:
-        # prefer MP4-compatible streams, then wider fallbacks
+        # Prefer MP4-compatible, then broader fallbacks; finally progressive best
         return (
             "bv*[height<=" + str(height) + "][ext=mp4]+ba[ext=m4a]/"
             "bv*[height<=" + str(height) + "]+ba/"
@@ -110,30 +108,26 @@ def _build_format_string(mode: str, height: int) -> str:
 
 
 def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLResult:
-    """Synchronous helper used in a thread via asyncio.to_thread with robust fallbacks."""
+    """Blocking download with robust format fallbacks. Called via asyncio.to_thread."""
     opts = dict(YTDLP_COMMON)
     opts["paths"] = {"home": str(workdir)}
     opts["merge_output_format"] = "mp4"
-
-    fmt = _build_format_string(mode, height)
-    opts["format"] = fmt
+    opts["format"] = _build_format_string(mode, height)
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except DownloadError as e:
         msg = str(e)
-        # Retry 1: if specific format missing, simplify
         if "Requested format is not available" in msg:
-            opts_simple = dict(opts)
-            opts_simple["format"] = "b/best" if mode != "audio" else "ba/bestaudio/best"
-            with yt_dlp.YoutubeDL(opts_simple) as y2:
+            opts2 = dict(opts)
+            opts2["format"] = "b/best" if mode != "audio" else "ba/bestaudio/best"
+            with yt_dlp.YoutubeDL(opts2) as y2:
                 info = y2.extract_info(url, download=True)
-        # Retry 2: 403 workaround
         elif "HTTP Error 403" in msg or "Forbidden" in msg:
-            opts_android = dict(opts)
-            opts_android["extractor_args"] = {"youtube": {"player_client": ["android"]}}
-            with yt_dlp.YoutubeDL(opts_android) as y3:
+            opts3 = dict(opts)
+            opts3["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+            with yt_dlp.YoutubeDL(opts3) as y3:
                 info = y3.extract_info(url, download=True)
         else:
             raise
@@ -142,13 +136,13 @@ def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLResult:
         fn = Path(info["requested_downloads"][0]["filepath"])
     else:
         suffix = ".mp3" if mode == "audio" else ".mp4"
-        with yt_dlp.YoutubeDL(opts) as ydl_tmp:
-            fn = Path(ydl_tmp.prepare_filename(info)).with_suffix(suffix)
+        with yt_dlp.YoutubeDL(opts) as ytmp:
+            fn = Path(ytmp.prepare_filename(info)).with_suffix(suffix)
     title = info.get("title", fn.stem)
     return DLResult(path=fn, title=title, ext=fn.suffix.lstrip("."))
 
 
-# -------------------- playlist helpers --------------------
+# --------------- playlist helpers & archiving ---------------
 
 def _safe_stem(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._ -]+", "_", (name or "file")).strip()
@@ -201,16 +195,15 @@ def make_zip(files: List[Tuple[Path, str]], outdir: Path, batch_idx: int) -> Pat
     return zpath
 
 
-# -------------------- Telegram handlers --------------------
+# ------------------------ handlers -------------------------
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     lines = [
-        "Привет! Пришли команду в формате:",
+        "Привет! Команды:",
         "/get <YouTube URL> [video|audio] [360|480|720|1080|max]",
-        "/getall <channel_or_playlist_url> [video|audio] [360|480|720|1080|max]",
-        "",
-        "По умолчанию качество: MAX. В /getall архивируем каждые 10 видео (без ограничений по размеру).",
+        "/getall <канал/плейлист URL> [video|audio] [360|480|720|1080|max]",
+        "По умолчанию качество: MAX. В /getall архивируем каждые 10 видео.",
     ]
     await message.reply("
 ".join(lines))
@@ -228,7 +221,7 @@ async def cmd_guide(message: Message):
         p.write_text(GUIDE_TEXT, encoding="utf-8")
         await message.answer_document(
             FSInputFile(str(p), filename="yt_dlp_bot_guide.html"),
-            caption="Справка к боту",
+            caption="Guide",
         )
 
 
@@ -262,7 +255,7 @@ async def cmd_get(message: Message):
         elif m2.isdigit():
             height = int(m2)
 
-    await message.reply("Ок, качаю " + ("аудио" if mode == "audio" else "видео") + ": качество = " + ("MAX" if height == 0 else str(height)))
+    await message.reply("Ок, качаю {}: качество = {}".format("аудио" if mode == "audio" else "видео", "MAX" if height == 0 else str(height)))
 
     with tempfile.TemporaryDirectory() as td:
         workdir = Path(td)
@@ -272,12 +265,9 @@ async def cmd_get(message: Message):
             await message.reply("Не получилось скачать: " + str(e))
             return
 
-        out_path = dl.path
-
         try:
-            caption = str(dl.title) + " (через yt-dlp)"
-            file = FSInputFile(str(out_path))
-            await message.answer_document(file, caption=caption)
+            caption = str(dl.title) + " (yt-dlp)"
+            await message.answer_document(FSInputFile(str(dl.path)), caption=caption)
         except Exception as e:
             await message.reply("Не удалось отправить файл: " + str(e))
 
@@ -286,9 +276,7 @@ async def cmd_get(message: Message):
 async def cmd_getall(message: Message):
     args = (message.text or "").split()
     if len(args) < 2:
-        await message.reply(
-            "Использование: /getall <ссылка на канал/плейлист> [video|audio] [360|480|720|1080|max]"
-        )
+        await message.reply("Использование: /getall <ссылка на канал/плейлист> [video|audio] [360|480|720|1080|max]")
         return
 
     url = args[1].strip()
@@ -297,7 +285,7 @@ async def cmd_getall(message: Message):
         return
 
     mode = "video"
-    height = DEFAULT_HEIGHT  # 0 => MAX
+    height = DEFAULT_HEIGHT
 
     for token in args[2:]:
         t = token.lower()
@@ -308,8 +296,7 @@ async def cmd_getall(message: Message):
         elif t.isdigit():
             height = int(t)
 
-    await message.reply("Собираю список видео…")
-
+    await message.reply("Собираю список…")
     try:
         urls = await asyncio.to_thread(list_playlist_urls, url)
     except Exception as e:
@@ -317,13 +304,13 @@ async def cmd_getall(message: Message):
         return
 
     if not urls:
-        await message.reply("Видео не нашлись. Возможно, нужен другой URL (например, вкладка /videos канала).")
+        await message.reply("Видео не нашлись. Возможно, нужен /videos URL у канала.")
         return
 
     total = len(urls)
-    await message.reply("Найдено " + str(total) + " видео. Скачиваю и архивирую каждые " + str(BATCH_SIZE) + ".")
+    await message.reply("Найдено {} видео. Скачиваю и архивирую каждые {}.".format(total, BATCH_SIZE))
 
-    # One persistent temp dir so files live until zipped
+    # Persistent temp dir for the whole batch so files live until zipped
     with tempfile.TemporaryDirectory() as session_td:
         session_dir = Path(session_td)
         workdir = session_dir / "items"
@@ -335,25 +322,25 @@ async def cmd_getall(message: Message):
 
         for idx, watch_url in enumerate(urls, 1):
             try:
-                note = await message.answer(str(idx) + "/" + str(total) + " — скачиваю…")
+                note = await message.answer("{}/{} — скачиваю…".format(idx, total))
                 try:
                     dl = await asyncio.to_thread(ytdlp_download, watch_url, mode, height, workdir)
                 except Exception as e:
-                    await note.edit_text(str(idx) + "/" + str(total) + " — ошибка: " + str(e))
+                    await note.edit_text("{}/{} — ошибка: {}".format(idx, total, e))
                     continue
 
                 batch_files.append((dl.path, dl.title))
                 processed += 1
-                await note.edit_text(str(idx) + "/" + str(total) + " — готово, добавлено в пакет")
+                await note.edit_text("{}/{} — готово, добавлено в пакет".format(idx, total))
 
-                # every BATCH_SIZE videos → make a ZIP and send
+                # Archive every BATCH_SIZE items
                 if len(batch_files) >= BATCH_SIZE:
                     z = make_zip(batch_files, session_dir, batch_index)
                     try:
-                        cap = "Пакет " + str(batch_index) + " (" + str(len(batch_files)) + " видео) — " + z.name
+                        cap = "Пакет {} ({} видео) — {}".format(batch_index, BATCH_SIZE, z.name)
                         await message.answer_document(FSInputFile(str(z)), caption=cap)
                     except Exception as e:
-                        await message.answer("Не удалось отправить архив " + z.name + ": " + str(e))
+                        await message.answer("Не удалось отправить архив {}: {}".format(z.name, e))
                     batch_files = []
                     batch_index += 1
 
@@ -361,16 +348,16 @@ async def cmd_getall(message: Message):
             except Exception:
                 continue
 
-        # remaining files → last ZIP
+        # Remaining files
         if batch_files:
             z = make_zip(batch_files, session_dir, batch_index)
             try:
-                cap = "Пакет " + str(batch_index) + " (" + str(len(batch_files)) + " видео) — " + z.name
+                cap = "Пакет {} ({} видео) — {}".format(batch_index, len(batch_files), z.name)
                 await message.answer_document(FSInputFile(str(z)), caption=cap)
             except Exception as e:
-                await message.answer("Не удалось отправить архив " + z.name + ": " + str(e))
+                await message.answer("Не удалось отправить архив {}: {}".format(z.name, e))
 
-    await message.reply("Готово. Обработано: " + str(processed) + " из " + str(total) + ".")
+    await message.reply("Готово. Обработано: {} из {}.".format(processed, total))
 
 
 # -------------------- entrypoint --------------------
