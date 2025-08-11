@@ -3,23 +3,8 @@ Telegram bot that downloads YouTube videos (or audio) with yt-dlp
 and sends them back in chat.
 
 ⚠️ Use only for content you own or have permission to download.
-   Respect YouTube's Terms of Service and your local laws.
-
-Quick start (local or in Docker)
---------------------------------
-1) Python 3.10+ and ffmpeg (Dockerfile installs ffmpeg for you)
-2) pip install -r requirements.txt
-3) .env must contain: BOT_TOKEN=123456:ABC...
-4) python telegram_ytdlp_bot.py
-
-Commands
---------
-/start  — brief help
-/help   — inline guide
-/guide  — guide as HTML file
-/get <url> [video|audio] [360|480|720|1080]
-/getall <channel_or_playlist_url> [video|audio] [360|480|720|1080] [limit=ALL|N] [archive]
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -30,7 +15,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher
@@ -41,7 +26,7 @@ from dotenv import load_dotenv
 import yt_dlp
 
 # ---------------- configuration ----------------
-TARGET_MB = 49          # aim to stay below common Telegram Bot API upload limits
+TARGET_MB = 49          # aim to stay below common Bot API upload limit
 ARCHIVE_PART_MB = 47    # ZIP part size when archiving (leave headroom)
 DEFAULT_HEIGHT = 480    # default max height for video
 ALLOWED_NETLOC = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
@@ -55,32 +40,27 @@ if not BOT_TOKEN:
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-GUIDE_TEXT = (
-    """
-<b>YT-DLP Telegram Bot — Guide</b>
+# Guide text as safe joined lines (no triple quotes)
+GUIDE_LINES: List[str] = [
+    "<b>YT-DLP Telegram Bot — Guide</b>",
+    "",
+    "<b>What it does</b>",
+    "• /get &lt;url&gt; [video|audio] [360|480|720|1080] — download single video or audio",
+    "• /getall &lt;channel_or_playlist_url&gt; [video|audio] [360|480|720|1080] [limit=ALL|N] [archive] — bulk",
+    "",
+    "<b>Tips</b>",
+    "• For channels use the /videos URL (e.g. https://www.youtube.com/@YourChannel/videos)",
+    "• If a file is large, the bot will try to shrink to ~49 MB. For reliability use “video 360”.",
+    "• When you set <code>limit=ALL</code>, archiving turns ON automatically. You can also force it with the word <code>archive</code>.",
+    "• Download only content you have rights to.",
+    "",
+    "<b>Telegram limits</b>",
+    "• Public Bot API uploads: ~50 MB per file.",
+    "• Local Bot API Server: up to 2 GB.",
+]
+GUIDE_TEXT = "\n".join(GUIDE_LINES)
 
-<b>What it does</b>
-• /get &lt;url&gt; [video|audio] [360|480|720|1080] — download single video or audio
-• /getall &lt;channel_or_playlist_url&gt; [video|audio] [360|480|720|1080] [limit=ALL|N] [archive] — bulk
-
-<b>Tips</b>
-• For channels use the /videos URL (e.g. https://www.youtube.com/@YourChannel/videos)
-• If a file is large, the bot will try to shrink to ~49 MB. For reliability use “video 360”.
-• When you set <code>limit=ALL</code>, the bot automatically switches archiving ON. You can also force it with the word <code>archive</code>.
-• Download only content you have rights to.
-
-<b>Telegram limits</b>
-• Public Bot API uploads: ~50 MB per file.
-• Local Bot API Server: up to 2 GB.
-
-<b>Deploy</b>
-• Repo needs: telegram_ytdlp_bot.py, requirements.txt, Dockerfile.
-• Set BOT_TOKEN env var.
-• Run in Docker or any Python host (long-polling).
-"""
-)
-
-YTDLP_COMMON = {
+YTDLP_COMMON: Dict[str, object] = {
     "outtmpl": "%(title).80s.%(ext)s",
     "noplaylist": True,
     "quiet": True,
@@ -138,9 +118,10 @@ async def shrink_video(in_path: Path, out_path: Path, target_mb: int = TARGET_MB
     duration = await ffprobe_duration(in_path) or 0.0
     if duration <= 0:
         cmd = (
-            "ffmpeg -y -i " + shlex.quote(str(in_path)) + " -vf scale=-2:" + str(height) +
-            " -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -movflags +faststart " +
-            shlex.quote(str(out_path))
+            "ffmpeg -y -i " + shlex.quote(str(in_path))
+            + " -vf scale=-2:" + str(height)
+            + " -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -movflags +faststart "
+            + shlex.quote(str(out_path))
         )
         code, _, _ = await run_cmd(cmd)
         return code == 0 and out_path.exists()
@@ -150,10 +131,13 @@ async def shrink_video(in_path: Path, out_path: Path, target_mb: int = TARGET_MB
     vbps = max(300_000, int(target_bits / duration) - audio_kbps * 1000)
 
     cmd = (
-        "ffmpeg -y -i " + shlex.quote(str(in_path)) + " -vf scale=-2:" + str(height) +
-        " -c:v libx264 -preset veryfast -b:v " + str(vbps) + " -maxrate " + str(int(vbps*1.2)) +
-        " -bufsize " + str(int(vbps*2)) + " -c:a aac -b:a " + str(audio_kbps) +
-        "k -movflags +faststart " + shlex.quote(str(out_path))
+        "ffmpeg -y -i " + shlex.quote(str(in_path))
+        + " -vf scale=-2:" + str(height)
+        + " -c:v libx264 -preset veryfast -b:v " + str(vbps)
+        + " -maxrate " + str(int(vbps * 1.2))
+        + " -bufsize " + str(int(vbps * 2))
+        + " -c:a aac -b:a " + str(audio_kbps) + "k -movflags +faststart "
+        + shlex.quote(str(out_path))
     )
     code, _, _ = await run_cmd(cmd)
     return code == 0 and out_path.exists()
@@ -200,9 +184,9 @@ def _safe_stem(name: str) -> str:
     return s or "file"
 
 
-def make_zip_parts(files: list[tuple[Path, str]], outdir: Path, part_mb: int = ARCHIVE_PART_MB) -> list[Path]:
+def make_zip_parts(files: List[Tuple[Path, str]], outdir: Path, part_mb: int = ARCHIVE_PART_MB) -> List[Path]:
     """Create multi-part ZIPs (stored) about <= part_mb each."""
-    parts: list[Path] = []
+    parts: List[Path] = []
     if not files:
         return parts
 
@@ -234,28 +218,20 @@ def make_zip_parts(files: list[tuple[Path, str]], outdir: Path, part_mb: int = A
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    text = (
-        "Привет! Пришли команду в формате:
-"
-        "/get <YouTube URL> [video|audio] [360|480|720|1080]
-
-"
-        "Например:
-"
-        "/get https://youtu.be/dQw4w9WgXcQ
-"
-        "/get https://youtu.be/dQw4w9WgXcQ audio
-"
-        "/get https://youtu.be/dQw4w9WgXcQ video 480
-
-"
-        "⚠️ Загружай только то, на что у тебя есть права.
-
-"
-        "Доп. команды: /help /guide /getall
-"
-    )
-    await message.reply(text)
+    lines = [
+        "Привет! Пришли команду в формате:",
+        "/get <YouTube URL> [video|audio] [360|480|720|1080]",
+        "",
+        "Например:",
+        "/get https://youtu.be/dQw4w9WgXcQ",
+        "/get https://youtu.be/dQw4w9WgXcQ audio",
+        "/get https://youtu.be/dQw4w9WgXcQ video 480",
+        "",
+        "⚠️ Загружай только то, на что у тебя есть права.",
+        "",
+        "Доп. команды: /help /guide /getall",
+    ]
+    await message.reply("\n".join(lines))
 
 
 @dp.message(Command("help"))
@@ -320,16 +296,16 @@ async def cmd_get(message: Message):
         except Exception:
             pass
 
-       # send back
-# send back
-try:
-    file = FSInputFile(str(out_path))
-    await message.answer_document(file)  # без caption
-except Exception as e:
-    size = sizeof_mb(out_path)
-    msg = "Не удалось отправить файл. Размер: " + "{:.1f}".format(size) + \
-          " MB. Попробуй /get <url> video 360 или аудио.\nТех. причина: " + str(e)
-    await message.reply(msg)
+        # send back (NO multiline strings)
+        try:
+            caption = str(dl.title) + " (через yt-dlp)"
+            file = FSInputFile(str(out_path))
+            await message.answer_document(file, caption=caption)
+        except Exception as e:
+            size = sizeof_mb(out_path)
+            msg = "Не удалось отправить файл. Размер: " + "{:.1f}".format(size) + \
+                  " MB. Попробуй /get <url> video 360 или аудио.\nТех. причина: " + str(e)
+            await message.reply(msg)
 
 
 # ------------- bulk channel/playlist support -------------
@@ -343,7 +319,7 @@ def _normalize_watch_url(entry: dict) -> Optional[str]:
     return url
 
 
-def list_playlist_urls(url: str, limit: Optional[int] = None) -> list[str]:
+def list_playlist_urls(url: str, limit: Optional[int] = None) -> List[str]:
     opts = dict(YTDLP_COMMON)
     opts.update({
         "noplaylist": False,
@@ -355,7 +331,7 @@ def list_playlist_urls(url: str, limit: Optional[int] = None) -> list[str]:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
         entries = info.get("entries") or []
-        urls: list[str] = []
+        urls: List[str] = []
         seen = set()
         for e in entries:
             if not isinstance(e, dict):
@@ -408,8 +384,8 @@ async def cmd_getall(message: Message):
             do_archive = False
 
     await message.reply(
-        "Собираю список… limit=" + ("ALL" if (limit is None) else str(limit)) +
-        " | archive=" + ("ON" if do_archive else "OFF")
+        "Собираю список… limit=" + ("ALL" if (limit is None) else str(limit))
+        + " | archive=" + ("ON" if do_archive else "OFF")
     )
 
     try:
@@ -426,7 +402,7 @@ async def cmd_getall(message: Message):
     total = len(urls)
     await message.reply("Нашёл " + str(total) + " видео. Начинаю скачивание…")
 
-    files_for_zip: list[tuple[Path, str]] = []
+    files_for_zip: List[Tuple[Path, str]] = []
 
     for idx, watch_url in enumerate(urls, 1):
         try:
@@ -454,8 +430,7 @@ async def cmd_getall(message: Message):
                     await note.edit_text(str(idx) + "/" + str(total) + " — готово (в архив)")
                 else:
                     try:
-                        caption = str(dl.title) + "
-(через yt-dlp)"
+                        caption = str(dl.title) + " (через yt-dlp)"
                         file = FSInputFile(str(out_path))
                         await message.answer_document(file, caption=caption)
                         sent += 1
@@ -468,7 +443,7 @@ async def cmd_getall(message: Message):
             continue
 
     if do_archive:
-        await message.reply("Формирую ZIP‑архивы…")
+        await message.reply("Формирую ZIP-архивы…")
         with tempfile.TemporaryDirectory() as zd:
             zdir = Path(zd)
             parts = make_zip_parts(files_for_zip, zdir, part_mb=ARCHIVE_PART_MB)
