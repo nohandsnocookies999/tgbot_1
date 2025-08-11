@@ -212,26 +212,19 @@ async def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLR
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.reply(
-        "Привет! Пришли команду в формате:
-"
-        "/get <YouTube URL> [video|audio] [360|480|720]
+    text = """Привет! Пришли команду в формате:
+/get <YouTube URL> [video|audio] [360|480|720]
 
-"
-        "Например:
-"
-        "/get https://youtu.be/dQw4w9WgXcQ
-"
-        "/get https://youtu.be/dQw4w9WgXcQ audio
-"
-        "/get https://youtu.be/dQw4w9WgXcQ video 480
+Например:
+/get https://youtu.be/dQw4w9WgXcQ
+/get https://youtu.be/dQw4w9WgXcQ audio
+/get https://youtu.be/dQw4w9WgXcQ video 480
 
-"
-        "⚠️ Загружай только то, на что у тебя есть права.
+⚠️ Загружай только то, на что у тебя есть права.
 
-"
-        "Доп. команды: /help /guide /getall"
-    )
+Доп. команды: /help /guide /getall
+"""
+    await message.reply(text)
 
 
 @dp.message(Command("help"))
