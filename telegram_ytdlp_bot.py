@@ -37,8 +37,7 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 # Guide text (avoid multiline literals)
-GUIDE_TEXT = "
-".join([
+GUIDE_TEXT = "".join([
     "<b>YT‑DLP Telegram Bot — Guide</b>",
     "",
     "<b>Commands</b>",
