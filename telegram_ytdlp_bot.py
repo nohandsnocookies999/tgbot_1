@@ -24,6 +24,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, FSInputFile
 from dotenv import load_dotenv
 import yt_dlp
+from yt_dlp.utils import DownloadError
 
 # ---------------- configuration ----------------
 TARGET_MB = 49          # aim to stay below common Bot API upload limit
@@ -49,7 +50,7 @@ GUIDE_LINES: List[str] = [
     "• /getall &lt;channel_or_playlist_url&gt; [video|audio] [360|480|720|1080|max] [limit=ALL|N] [archive] — bulk",
     "",
     "<b>Tips</b>",
-    "• Default quality is MAX (bestvideo+bestaudio with safe fallbacks).",
+    "• Default quality is MAX (bestvideo+bestaudio with robust fallbacks).",
     "• If a file is large, Telegram's ~50 MB upload limit may block sending. For MAX quality, the bot will ZIP big files automatically in /getall; for /get it zips only when MAX is requested and file is big.",
     "• For channels use the /videos URL (e.g. https://www.youtube.com/@YourChannel/videos)",
     "• Download only content you have rights to.",
@@ -58,7 +59,8 @@ GUIDE_LINES: List[str] = [
     "• Public Bot API uploads: ~50 MB per file.",
     "• Local Bot API Server: up to 2 GB.",
 ]
-GUIDE_TEXT = "\n".join(GUIDE_LINES)
+GUIDE_TEXT = "
+".join(GUIDE_LINES)
 
 YTDLP_COMMON: Dict[str, object] = {
     "outtmpl": "%(title).80s.%(ext)s",
@@ -66,6 +68,18 @@ YTDLP_COMMON: Dict[str, object] = {
     "quiet": True,
     "no_warnings": True,
     "concurrent_fragment_downloads": 5,
+    # Help with occasional 403s and codec/container issues
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.youtube.com/",
+    },
+    "extractor_args": {
+        "youtube": {
+            # try multiple clients; yt-dlp will pick first that works
+            "player_client": ["android", "web_safari", "web"],
+        }
+    },
 }
 
 
@@ -143,43 +157,58 @@ async def shrink_video(in_path: Path, out_path: Path, target_mb: int = TARGET_MB
     return code == 0 and out_path.exists()
 
 
+def _build_format_string(mode: str, height: int) -> str:
+    if mode == "audio":
+        return "ba/bestaudio/best"
+    # video
+    if height and height > 0:
+        # prefer mp4-compatible streams but be very forgiving; final fallbacks to single best
+        return \
+            "bv*[height<=" + str(height) + "][ext=mp4]+ba[ext=m4a]/" + \
+            "bv*[height<=" + str(height) + "]+ba/" + \
+            "b[height<=" + str(height) + "]/" + \
+            "bv*+ba/b"
+    # MAX quality
+    return "bv*+ba/b"
+
+
 def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLResult:
-    """Synchronous helper used in a thread via asyncio.to_thread."""
+    """Synchronous helper used in a thread via asyncio.to_thread with robust fallbacks."""
     opts = dict(YTDLP_COMMON)
     opts["paths"] = {"home": str(workdir)}
+    opts["merge_output_format"] = "mp4"
 
-    if mode == "audio":
-        opts.update(
-            {
-                "format": "ba/bestaudio/best",
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }
-                ],
-                "merge_output_format": None,
-            }
-        )
+    fmt = _build_format_string(mode, height)
+    opts["format"] = fmt
+
+    # First try with default extractor_args (android/web), then retry on specific errors
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except DownloadError as e:
+        msg = str(e)
+        # Retry 1: simplify to absolute best (progressive) if format selection failed
+        if "Requested format is not available" in msg:
+            opts_simple = dict(opts)
+            opts_simple["format"] = "b/best" if mode != "audio" else "ba/bestaudio/best"
+            with yt_dlp.YoutubeDL(opts_simple) as y2:
+                info = y2.extract_info(url, download=True)
+        # Retry 2: 403 workaround — force android client only
+        elif "HTTP Error 403" in msg or "Forbidden" in msg:
+            opts_android = dict(opts)
+            opts_android["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+            with yt_dlp.YoutubeDL(opts_android) as y3:
+                info = y3.extract_info(url, download=True)
+        else:
+            raise
+
+    if "requested_downloads" in info and info["requested_downloads"]:
+        fn = Path(info["requested_downloads"][0]["filepath"])
     else:
-        if height and height > 0:
-            # try best video up to height + best audio, else single best up to height, else absolute best
-            fmt = "bv*[height<=" + str(height) + "]+ba/b[height<=" + str(height) + "]/b"
-        else:
-            # MAX quality
-            fmt = "bv*+ba/b"
-        opts.update({"format": fmt, "merge_output_format": "mp4"})
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if "requested_downloads" in info and info["requested_downloads"]:
-            fn = Path(info["requested_downloads"][0]["filepath"])
-        else:
-            suffix = ".mp3" if mode == "audio" else ".mp4"
-            fn = Path(ydl.prepare_filename(info)).with_suffix(suffix)
-        title = info.get("title", fn.stem)
-        return DLResult(path=fn, title=title, ext=fn.suffix.lstrip("."))
+        suffix = ".mp3" if mode == "audio" else ".mp4"
+        fn = Path(yt_dlp.YoutubeDL(opts).prepare_filename(info)).with_suffix(suffix)
+    title = info.get("title", fn.stem)
+    return DLResult(path=fn, title=title, ext=fn.suffix.lstrip("."))
 
 
 # -------------------- archiving helpers --------------------
@@ -203,7 +232,6 @@ def make_zip_parts(files: List[Tuple[Path, str]], outdir: Path, part_mb: int = A
 
     for p, title in files:
         if not p.exists():
-            # skip missing files (e.g., if temp dir was cleaned)
             continue
         sz = p.stat().st_size
         if current_size > 0 and (current_size + sz) > part_bytes:
@@ -239,7 +267,8 @@ async def cmd_start(message: Message):
         "",
         "Доп. команды: /help /guide /getall",
     ]
-    await message.reply("\n".join(lines))
+    await message.reply("
+".join(lines))
 
 
 @dp.message(Command("help"))
@@ -326,7 +355,8 @@ async def cmd_get(message: Message):
         except Exception as e:
             size = sizeof_mb(out_path)
             msg = "Не удалось отправить файл. Размер: " + "{:.1f}".format(size) + \
-                  " MB. Попробуй /get <url> video 360 или аудио.\nТех. причина: " + str(e)
+                  " MB. Попробуй /get <url> video 360 или аудио.
+Тех. причина: " + str(e)
             await message.reply(msg)
 
 
@@ -431,7 +461,7 @@ async def cmd_getall(message: Message):
     total = len(urls)
     await message.reply("Нашёл " + str(total) + " видео. Начинаю скачивание…")
 
-    # persistent temp dir for whole batch (fixes FileNotFoundError when archiving)
+    # persistent temp dir for whole batch (keeps files alive until zipped)
     with tempfile.TemporaryDirectory() as session_td:
         session_dir = Path(session_td)
         bundle_dir = session_dir / "bundle"
@@ -443,7 +473,6 @@ async def cmd_getall(message: Message):
         for idx, watch_url in enumerate(urls, 1):
             try:
                 note = await message.answer(str(idx) + "/" + str(total) + " — скачиваю…")
-
                 # choose working directory per item
                 if do_archive:
                     workdir = bundle_dir
