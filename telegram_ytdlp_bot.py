@@ -1,4 +1,4 @@
-# Telegram YT-DLP Bot — MAX quality + archive every 10 videos (upload to PixelDrain)
+# Telegram YT-DLP Bot — MAX quality + archive every 10 (PixelDrain) + Inline menu
 # Use only for content you are allowed to download.
 
 from __future__ import annotations
@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import shlex
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -16,8 +15,12 @@ from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.types import Message, FSInputFile
+from aiogram.filters import Command, Text
+from aiogram.types import (
+    Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 from dotenv import load_dotenv
 import yt_dlp
 from yt_dlp.utils import DownloadError
@@ -25,12 +28,11 @@ import requests
 
 # ---------------- configuration ----------------
 BATCH_SIZE = 10         # /getall: make one ZIP after every N downloaded videos
-DEFAULT_HEIGHT = 0      # 0 => MAX quality by default
+DEFAULT_HEIGHT = 0      # 0 => MAX quality by default (always MAX as per requirements)
 ALLOWED_NETLOC = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
 PIXEL_API = "https://pixeldrain.com/api/file"
 PIXEL_VIEW = "https://pixeldrain.com/u/"
 PIXEL_DL   = "https://pixeldrain.com/api/file/"
-# Optional: if you have a PixelDrain API key (to attach uploads to your account)
 PIXEL_API_KEY = os.getenv("PIXELDRAIN_API_KEY") or os.getenv("PIXEL_API_KEY")
 # ------------------------------------------------
 
@@ -46,12 +48,10 @@ dp = Dispatcher()
 GUIDE_TEXT = "\n".join([
     "<b>YT-DLP Telegram Bot — Guide</b>",
     "",
-    "<b>Commands</b>",
-    "/get <url> [video|audio] [360|480|720|1080|max]",
-    "/getall <channel_or_playlist_url> [video|audio] [360|480|720|1080|max]",
+    "Бот завжди качає у максимально можливій якості (MAX).",
     "",
-    "Default quality: MAX.",
-    "In /getall the bot archives every 10 videos and uploads ZIP to PixelDrain, replying with a link.",
+    "Меню: кнопками можна обрати режим — одне відео, всі/останні N, топ-20 за переглядами, увесь плейліст.",
+    "При пакетах бот архівує кожні 10 відео і вантажить ZIP на PixelDrain та дає лінки.",
 ])
 
 YTDLP_COMMON: Dict[str, object] = {
@@ -80,12 +80,28 @@ class DLResult:
     ext: str
 
 
+# ---------------- utilities ----------------
+
 def is_youtube_url(url: str) -> bool:
     try:
         netloc = urlparse(url).netloc.lower()
         return any(netloc.endswith(d) for d in ALLOWED_NETLOC)
     except Exception:
         return False
+
+
+def _normalize_watch_url(entry: dict) -> Optional[str]:
+    url = entry.get("webpage_url") or entry.get("url") or ""
+    if not url:
+        return None
+    if not url.startswith("http"):
+        return "https://www.youtube.com/watch?v=" + url
+    return url
+
+
+def _safe_stem(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._ -]+", "_", (name or "file")).strip()
+    return s or "file"
 
 
 async def run_cmd(cmd: str) -> Tuple[int, str, str]:
@@ -97,6 +113,8 @@ async def run_cmd(cmd: str) -> Tuple[int, str, str]:
     out_b, err_b = await proc.communicate()
     return proc.returncode, out_b.decode("utf-8", "ignore"), err_b.decode("utf-8", "ignore")
 
+
+# ---------------- yt-dlp helpers ----------------
 
 def _build_format_string(mode: str, height: int) -> str:
     if mode == "audio":
@@ -165,23 +183,10 @@ def upload_pixeldrain(path: Path) -> Tuple[str, str]:
     return view, direct
 
 
-# --------------- playlist helpers & archiving ---------------
+# ---------------- list & selection helpers ----------------
 
-def _safe_stem(name: str) -> str:
-    s = re.sub(r"[^A-Za-z0-9._ -]+", "_", (name or "file")).strip()
-    return s or "file"
-
-
-def _normalize_watch_url(entry: dict) -> Optional[str]:
-    url = entry.get("webpage_url") or entry.get("url") or ""
-    if not url:
-        return None
-    if not url.startswith("http"):
-        return "https://www.youtube.com/watch?v=" + url
-    return url
-
-
-def list_playlist_urls(url: str) -> List[str]:
+def list_entries_with_meta(url: str) -> List[Dict[str, object]]:
+    """Return list of entries with url, timestamp, view_count when available (no download)."""
     opts = dict(YTDLP_COMMON)
     opts.update({
         "noplaylist": False,
@@ -190,21 +195,89 @@ def list_playlist_urls(url: str) -> List[str]:
         "quiet": True,
         "no_warnings": True,
     })
+    entries: List[Dict[str, object]] = []
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
-        entries = info.get("entries") or []
-        urls: List[str] = []
-        seen = set()
-        for e in entries:
+        raw = info.get("entries") or []
+        for e in raw:
             if not isinstance(e, dict):
                 continue
             w = _normalize_watch_url(e)
-            if not w or w in seen:
+            if not w:
                 continue
-            seen.add(w)
-            urls.append(w)
-        return urls
+            # try to collect view_count and timestamp
+            vc = e.get("view_count")
+            ts = e.get("timestamp")
+            if not ts and e.get("upload_date"):
+                # upload_date like YYYYMMDD -> keep as int for ordering
+                try:
+                    ud = str(e.get("upload_date"))
+                    ts = int(ud)
+                except Exception:
+                    ts = None
+            entries.append({
+                "url": w,
+                "view_count": vc if isinstance(vc, int) else None,
+                "timestamp": ts if isinstance(ts, int) else None,
+            })
+    return entries
 
+
+def enrich_view_counts(urls: List[str], limit: int = 200) -> Dict[str, int]:
+    """Fetch view_count for up to 'limit' URLs (skip_download). Returns dict url->views."""
+    opts = dict(YTDLP_COMMON)
+    opts.update({"skip_download": True, "quiet": True, "no_warnings": True, "noplaylist": True})
+    views: Dict[str, int] = {}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        for u in urls[:limit]:
+            try:
+                info = ydl.extract_info(u, download=False)
+                vc = info.get("view_count")
+                if isinstance(vc, int):
+                    views[u] = vc
+            except Exception:
+                continue
+    return views
+
+
+def select_urls(mode: str, src_url: str) -> List[str]:
+    """mode: 'all', 'latest:10/20/30', 'top20', 'playlist_all'"""
+    items = list_entries_with_meta(src_url)
+    if not items:
+        return []
+    if mode == "all" or mode == "playlist_all":
+        return [it["url"] for it in items]
+    if mode.startswith("latest:"):
+        n = int(mode.split(":", 1)[1])
+        # sort by timestamp desc, fallback to original order
+        items2 = [it for it in items if it.get("timestamp") is not None]
+        items2.sort(key=lambda x: int(x.get("timestamp") or 0), reverse=True)
+        if len(items2) < n:
+            # pad with remaining in original order
+            seen = set(u["url"] for u in items2)
+            for it in items:
+                if it["url"] not in seen:
+                    items2.append(it)
+                    if len(items2) >= n:
+                        break
+        return [it["url"] for it in items2[:n]]
+    if mode == "top20":
+        # try sort by available view_count, enrich if needed
+        with_v = [it for it in items if isinstance(it.get("view_count"), int)]
+        without_v = [it for it in items if not isinstance(it.get("view_count"), int)]
+        if len(with_v) < 20 and without_v:
+            pool = [it["url"] for it in items]
+            extra = enrich_view_counts(pool, limit=200)
+            for it in items:
+                if it["url"] in extra:
+                    it["view_count"] = extra[it["url"]]
+            with_v = [it for it in items if isinstance(it.get("view_count"), int)]
+        with_v.sort(key=lambda x: int(x.get("view_count") or 0), reverse=True)
+        return [it["url"] for it in with_v[:20]]
+    return []
+
+
+# ---------------- archiving ----------------
 
 def make_zip_single(files: List[Tuple[Path, str]], outdir: Path, batch_idx: int) -> Path:
     zpath = outdir / ("batch_" + str(batch_idx).zfill(3) + ".zip")
@@ -218,76 +291,112 @@ def make_zip_single(files: List[Tuple[Path, str]], outdir: Path, batch_idx: int)
     return zpath
 
 
-# ------------------------ handlers -------------------------
+# ---------------- keyboards ----------------
 
-@dp.message(Command("start"))
+def menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📹 Скачати одне відео", callback_data="mode:single")],
+        [InlineKeyboardButton(text="📺 Всі відео з каналу", callback_data="mode:all")],
+        [InlineKeyboardButton(text="🆕 Останні 10", callback_data="mode:latest:10"),
+         InlineKeyboardButton(text="🆕 Останні 20", callback_data="mode:latest:20"),
+         InlineKeyboardButton(text="🆕 Останні 30", callback_data="mode:latest:30")],
+        [InlineKeyboardButton(text="🔥 Топ-20 за переглядами", callback_data="mode:top20")],
+        [InlineKeyboardButton(text="🎞 Увесь плейліст", callback_data="mode:playlist_all")],
+    ])
+
+
+class AwaitLink(StatesGroup):
+    waiting_for_link = State()
+
+
+# ---------------- handlers ----------------
+
+@dp.message(Command("start", "menu"))
 async def cmd_start(message: Message):
-    lines = [
-        "Привет! Команды:",
-        "/get <YouTube URL> [video|audio] [360|480|720|1080|max]",
-        "/getall <канал/плейлист URL> [video|audio] [360|480|720|1080|max]",
-        "По умолчанию качество: MAX. В /getall архивируем каждые 10 видео и заливаем ZIP на PixelDrain.",
-    ]
-    await message.reply("\n".join(lines))
+    text = "\n".join([
+        "Можемо скачати:",
+        "",
+        "• 📹 одне відео — попрошу лінк на відео і відправлю файл у Телеграм (якщо надто великий — лінк на PixelDrain)",
+        "• 📺 всі відео з каналу — лінк на канал, архівація по 10 і завантаження на PixelDrain",
+        "• 🆕 останні 10 / 20 / 30 — лінк на канал, архівація по 10 і завантаження на PixelDrain",
+        "• 🔥 топ-20 за переглядами — лінк на канал, архівація по 10 і завантаження на PixelDrain",
+        "• 🎞 увесь плейліст — лінк на плейліст, архівація по 10 і завантаження на PixelDrain",
+        "",
+        "Якість: завжди максимально доступна.",
+    ])
+    await message.answer(text, reply_markup=menu_kb())
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(GUIDE_TEXT, parse_mode=ParseMode.HTML)
+    await message.answer(GUIDE_TEXT, parse_mode=ParseMode.HTML, reply_markup=menu_kb())
 
 
-@dp.message(Command("guide"))
-async def cmd_guide(message: Message):
-    with tempfile.TemporaryDirectory() as td:
-        p = Path(td) / "yt_dlp_bot_guide.html"
-        p.write_text(GUIDE_TEXT, encoding="utf-8")
-        await message.answer_document(
-            FSInputFile(str(p), filename="yt_dlp_bot_guide.html"),
-            caption="Guide",
-        )
+@dp.callback_query(Text(startswith="mode:"))
+async def cb_mode(call: CallbackQuery, state: FSMContext):
+    data = call.data  # e.g. mode:latest:20
+    await state.update_data(sel=data)
+    if data == "mode:single":
+        await call.message.answer("Кинь лінк на відео YouTube")
+    elif data == "mode:all":
+        await call.message.answer("Кинь лінк на канал YouTube (сторінка /videos)")
+    elif data.startswith("mode:latest:"):
+        await call.message.answer("Кинь лінк на канал YouTube (сторінка /videos)")
+    elif data == "mode:top20":
+        await call.message.answer("Кинь лінк на канал YouTube (сторінка /videos)")
+    elif data == "mode:playlist_all":
+        await call.message.answer("Кинь лінк на плейліст YouTube")
+    await state.set_state(AwaitLink.waiting_for_link)
+    await call.answer()
 
 
-@dp.message(Command("get"))
-async def cmd_get(message: Message):
-    args = (message.text or "").split()
-    if len(args) < 2:
-        await message.reply("Дай ссылку на YouTube после /get")
-        return
-
-    url = args[1].strip()
+@dp.message(AwaitLink.waiting_for_link)
+async def on_link(message: Message, state: FSMContext):
+    url = (message.text or "").strip()
     if not is_youtube_url(url):
-        await message.reply("Похоже, это не ссылка на YouTube.")
+        await message.reply("Схоже, це не лінк на YouTube. Спробуй ще раз або /menu.")
         return
 
-    mode = "video"
-    height = DEFAULT_HEIGHT  # 0 => MAX
+    data = await state.get_data()
+    sel = data.get("sel", "mode:single")
 
-    if len(args) >= 3:
-        m = args[2].lower()
-        if m in {"video", "audio"}:
-            mode = m
-        elif m == "max":
-            height = 0
-        elif m.isdigit():
-            height = int(m)
-    if len(args) >= 4:
-        m2 = args[3].lower()
-        if m2 == "max":
-            height = 0
-        elif m2.isdigit():
-            height = int(m2)
+    if sel == "mode:single":
+        await do_single(message, url)
+        await state.clear()
+        return
 
-    msg = "Ок, качаю {}: качество = {}".format("аудио" if mode == "audio" else "видео", "MAX" if height == 0 else str(height))
-    await message.reply(msg)
+    # Bulk selections
+    if sel == "mode:all":
+        urls = select_urls("all", url)
+    elif sel == "mode:playlist_all":
+        urls = select_urls("playlist_all", url)
+    elif sel.startswith("mode:latest:"):
+        n = sel.split(":")[-1]
+        urls = select_urls("latest:" + n, url)
+    elif sel == "mode:top20":
+        urls = select_urls("top20", url)
+    else:
+        urls = []
 
+    if not urls:
+        await message.reply("Не вдалося зібрати список відео. Перевір лінк або спробуй інший режим.")
+        return
+
+    await do_bulk(message, urls)
+    await state.clear()
+
+
+# ---------------- single & bulk flows ----------------
+
+async def do_single(message: Message, url: str) -> None:
+    await message.reply("Ок, качаю одне відео у максимальній якості…")
     with tempfile.TemporaryDirectory() as td:
         workdir = Path(td)
         try:
-            dl = await asyncio.to_thread(ytdlp_download, url, mode, height, workdir)
+            dl = await asyncio.to_thread(ytdlp_download, url, "video", DEFAULT_HEIGHT, workdir)
         except Exception as e:
-            await message.reply("Не получилось скачать: " + str(e))
+            await message.reply("Не вийшло скачати: " + str(e))
             return
-
         try:
             caption = str(dl.title) + " (yt-dlp)"
             await message.answer_document(FSInputFile(str(dl.path)), caption=caption)
@@ -296,53 +405,18 @@ async def cmd_get(message: Message):
             if ("Too Large" in err) or ("too big" in err) or ("413" in err):
                 try:
                     view, direct = await asyncio.to_thread(upload_pixeldrain, dl.path)
-                    text = f"Файл большой, залил на PixelDrain:\n{view}\nПрямая ссылка: {direct}"
+                    text = "Файл великий, залив на PixelDrain:\n" + view + "\nПряма лінка: " + direct
                     await message.answer(text)
                 except Exception as e2:
-                    await message.reply("Не удалось отправить файл и загрузить на PixelDrain: " + str(e2))
+                    await message.reply("Не вдалося надіслати файл і завантажити на PixelDrain: " + str(e2))
             else:
-                await message.reply("Не удалось отправить файл: " + err)
+                await message.reply("Не вдалося надіслати файл: " + err)
 
 
-@dp.message(Command("getall"))
-async def cmd_getall(message: Message):
-    args = (message.text or "").split()
-    if len(args) < 2:
-        await message.reply("Использование: /getall <ссылка на канал/плейлист> [video|audio] [360|480|720|1080|max]")
-        return
-
-    url = args[1].strip()
-    if not is_youtube_url(url):
-        await message.reply("Похоже, это не ссылка на YouTube.")
-        return
-
-    mode = "video"
-    height = DEFAULT_HEIGHT
-
-    for token in args[2:]:
-        t = token.lower()
-        if t in {"video", "audio"}:
-            mode = t
-        elif t == "max":
-            height = 0
-        elif t.isdigit():
-            height = int(t)
-
-    await message.reply("Собираю список…")
-    try:
-        urls = await asyncio.to_thread(list_playlist_urls, url)
-    except Exception as e:
-        await message.reply("Не удалось получить список видео: " + str(e))
-        return
-
-    if not urls:
-        await message.reply("Видео не нашлись. Возможно, нужен /videos URL у канала.")
-        return
-
+async def do_bulk(message: Message, urls: List[str]) -> None:
     total = len(urls)
-    await message.reply("Найдено " + str(total) + " видео. Пакеты по " + str(BATCH_SIZE) + " шт.; для каждого будет ссылка PixelDrain.")
+    await message.reply("Знайшов " + str(total) + " відео. Пакетую по " + str(BATCH_SIZE) + " у ZIP та вантажу на PixelDrain…")
 
-    # Persistent temp dir for the whole batch so files live until zipped
     with tempfile.TemporaryDirectory() as session_td:
         session_dir = Path(session_td)
         workdir = session_dir / "items"
@@ -354,25 +428,25 @@ async def cmd_getall(message: Message):
 
         for idx, watch_url in enumerate(urls, 1):
             try:
-                note = await message.answer(str(idx) + "/" + str(total) + " — скачиваю…")
+                note = await message.answer(str(idx) + "/" + str(total) + " — качаю…")
                 try:
-                    dl = await asyncio.to_thread(ytdlp_download, watch_url, mode, height, workdir)
+                    dl = await asyncio.to_thread(ytdlp_download, watch_url, "video", DEFAULT_HEIGHT, workdir)
                 except Exception as e:
-                    await note.edit_text(str(idx) + "/" + str(total) + " — ошибка: " + str(e))
+                    await note.edit_text(str(idx) + "/" + str(total) + " — помилка: " + str(e))
                     continue
 
                 batch_files.append((dl.path, dl.title))
                 processed += 1
-                await note.edit_text(str(idx) + "/" + str(total) + " — готово, добавлено в пакет")
+                await note.edit_text(str(idx) + "/" + str(total) + " — готово, додано у пакет")
 
                 if len(batch_files) >= BATCH_SIZE:
                     z = make_zip_single(batch_files, session_dir, batch_index)
                     try:
                         view, direct = await asyncio.to_thread(upload_pixeldrain, z)
-                        text = f"Пакет {batch_index} ({len(batch_files)} видео):\n{view}\nПрямая ссылка: {direct}"
+                        text = "Пакет " + str(batch_index) + " (" + str(len(batch_files)) + " відео):\n" + view + "\nПряма лінка: " + direct
                         await message.answer(text)
                     except Exception as e:
-                        await message.answer("Не удалось загрузить архив на PixelDrain: " + str(e))
+                        await message.answer("Не вдалося завантажити архів на PixelDrain: " + str(e))
                     batch_files = []
                     batch_index += 1
 
@@ -380,43 +454,66 @@ async def cmd_getall(message: Message):
             except Exception:
                 continue
 
-        # Remaining files
+        # remaining
         if batch_files:
             z = make_zip_single(batch_files, session_dir, batch_index)
             try:
                 view, direct = await asyncio.to_thread(upload_pixeldrain, z)
-                text = f"Пакет {batch_index} ({len(batch_files)} видео):\n{view}\nПрямая ссылка: {direct}"
+                text = "Пакет " + str(batch_index) + " (" + str(len(batch_files)) + " відео):\n" + view + "\nПряма лінка: " + direct
                 await message.answer(text)
             except Exception as e:
-                await message.answer("Не удалось загрузить архив на PixelDrain: " + str(e))
+                await message.answer("Не вдалося завантажити архів на PixelDrain: " + str(e))
 
-    await message.reply("Готово. Обработано: " + str(processed) + " из " + str(total) + ".")
+    await message.reply("Готово. Оброблено: " + str(processed) + " з " + str(total) + ".")
 
 
-# -------------------- lightweight self-tests --------------------
+# ---------------- lightweight self-tests --------------------
 
 def _selftest() -> None:
     # format string tests
     assert _build_format_string("audio", 0).startswith("ba"), "audio best format"
     assert "height<=720" in _build_format_string("video", 720), "height filter in format"
+    assert _build_format_string("video", 0) == "bv*+ba/b", "MAX quality default"
 
     # safe stem
     assert _safe_stem("a*b?c").startswith("a_b_c"), "safe stem replaces illegal chars"
+    assert _safe_stem("") == "file", "empty stem fallback"
 
-    # message formatting (the bug source): ensure f-strings with \n are correct
+    # message formatting with \n
     view = "https://pixeldrain.com/u/XYZ"
     direct = "https://pixeldrain.com/api/file/XYZ"
-    txt = f"Файл большой, залил на PixelDrain:\n{view}\nПрямая ссылка: {direct}"
+    txt = "Файл великий, залив на PixelDrain:\n" + view + "\nПряма лінка: " + direct
     assert "\n" in txt and view in txt and direct in txt
 
+    # keyboards
+    kb = menu_kb()
+    cds = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    for must in ["mode:single", "mode:all", "mode:latest:10", "mode:latest:20", "mode:latest:30", "mode:top20", "mode:playlist_all"]:
+        assert must in cds, "missing menu item: " + must
 
-# -------------------- entrypoint --------------------
+    # selection helpers: synthetic ordering
+    items = [
+        {"url": "u1", "timestamp": 20240101, "view_count": 10},
+        {"url": "u2", "timestamp": 20240103, "view_count": 50},
+        {"url": "u3", "timestamp": 20240102, "view_count": 20},
+    ]
+    latest_sorted = sorted(items, key=lambda x: int(x.get("timestamp") or 0), reverse=True)
+    assert [i["url"] for i in latest_sorted][:2] == ["u2", "u3"], "latest ordering"
+    top_sorted = sorted(items, key=lambda x: int(x.get("view_count") or 0), reverse=True)
+    assert [i["url"] for i in top_sorted][:2] == ["u2", "u3"], "top ordering"
+
+
+# ---------------- entrypoint ----------------
 
 async def main():
     if os.getenv("SELFTEST") == "1":
         _selftest()
         print("SELFTEST passed")
         return
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
     await dp.start_polling(bot)
 
 
