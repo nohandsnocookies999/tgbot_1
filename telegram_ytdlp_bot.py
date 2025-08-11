@@ -28,7 +28,7 @@ import yt_dlp
 # ---------------- configuration ----------------
 TARGET_MB = 49          # aim to stay below common Bot API upload limit
 ARCHIVE_PART_MB = 47    # ZIP part size when archiving (leave headroom)
-DEFAULT_HEIGHT = 480    # default max height for video
+DEFAULT_HEIGHT = 0      # 0 => MAX available quality by default
 ALLOWED_NETLOC = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
 # ------------------------------------------------
 
@@ -40,18 +40,18 @@ if not BOT_TOKEN:
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-# Guide text as safe joined lines (no triple quotes)
+# Guide text as safe joined lines (no triple quotes inside handlers)
 GUIDE_LINES: List[str] = [
     "<b>YT-DLP Telegram Bot — Guide</b>",
     "",
     "<b>What it does</b>",
-    "• /get &lt;url&gt; [video|audio] [360|480|720|1080] — download single video or audio",
-    "• /getall &lt;channel_or_playlist_url&gt; [video|audio] [360|480|720|1080] [limit=ALL|N] [archive] — bulk",
+    "• /get &lt;url&gt; [video|audio] [360|480|720|1080|max] — download single video or audio",
+    "• /getall &lt;channel_or_playlist_url&gt; [video|audio] [360|480|720|1080|max] [limit=ALL|N] [archive] — bulk",
     "",
     "<b>Tips</b>",
+    "• Default quality is MAX (bestvideo+bestaudio with safe fallbacks).",
+    "• If a file is large, Telegram's ~50 MB upload limit may block sending. For MAX quality, the bot will ZIP big files automatically in /getall; for /get it zips only when MAX is requested and file is big.",
     "• For channels use the /videos URL (e.g. https://www.youtube.com/@YourChannel/videos)",
-    "• If a file is large, the bot will try to shrink to ~49 MB. For reliability use “video 360”.",
-    "• When you set <code>limit=ALL</code>, archiving turns ON automatically. You can also force it with the word <code>archive</code>.",
     "• Download only content you have rights to.",
     "",
     "<b>Telegram limits</b>",
@@ -151,7 +151,7 @@ def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLResult:
     if mode == "audio":
         opts.update(
             {
-                "format": "bestaudio/best",
+                "format": "ba/bestaudio/best",
                 "postprocessors": [
                     {
                         "key": "FFmpegExtractAudio",
@@ -163,7 +163,12 @@ def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLResult:
             }
         )
     else:
-        fmt = "bestvideo[height<=" + str(height) + "]+bestaudio/best[height<=" + str(height) + "]"
+        if height and height > 0:
+            # try best video up to height + best audio, else single best up to height, else absolute best
+            fmt = "bv*[height<=" + str(height) + "]+ba/b[height<=" + str(height) + "]/b"
+        else:
+            # MAX quality
+            fmt = "bv*+ba/b"
         opts.update({"format": fmt, "merge_output_format": "mp4"})
 
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -194,16 +199,19 @@ def make_zip_parts(files: List[Tuple[Path, str]], outdir: Path, part_mb: int = A
     part_idx = 1
     current_size = 0
     zpath = outdir / ("bundle_part" + str(part_idx).zfill(2) + ".zip")
-    zf = zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_STORED)
+    zf = zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_STORED, allowZip64=True)
 
     for p, title in files:
+        if not p.exists():
+            # skip missing files (e.g., if temp dir was cleaned)
+            continue
         sz = p.stat().st_size
         if current_size > 0 and (current_size + sz) > part_bytes:
             zf.close()
             parts.append(zpath)
             part_idx += 1
             zpath = outdir / ("bundle_part" + str(part_idx).zfill(2) + ".zip")
-            zf = zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_STORED)
+            zf = zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_STORED, allowZip64=True)
             current_size = 0
         arcname = _safe_stem(title) + p.suffix.lower()
         zf.write(p, arcname=arcname)
@@ -220,12 +228,12 @@ def make_zip_parts(files: List[Tuple[Path, str]], outdir: Path, part_mb: int = A
 async def cmd_start(message: Message):
     lines = [
         "Привет! Пришли команду в формате:",
-        "/get <YouTube URL> [video|audio] [360|480|720|1080]",
+        "/get <YouTube URL> [video|audio] [360|480|720|1080|max]",
         "",
         "Например:",
         "/get https://youtu.be/dQw4w9WgXcQ",
         "/get https://youtu.be/dQw4w9WgXcQ audio",
-        "/get https://youtu.be/dQw4w9WgXcQ video 480",
+        "/get https://youtu.be/dQw4w9WgXcQ video max",
         "",
         "⚠️ Загружай только то, на что у тебя есть права.",
         "",
@@ -263,18 +271,24 @@ async def cmd_get(message: Message):
         return
 
     mode = "video"
-    height = DEFAULT_HEIGHT
+    height = DEFAULT_HEIGHT  # 0 => MAX
 
     if len(args) >= 3:
         m = args[2].lower()
         if m in {"video", "audio"}:
             mode = m
+        elif m == "max":
+            height = 0
         elif m.isdigit():
             height = int(m)
-    if len(args) >= 4 and args[3].isdigit():
-        height = int(args[3])
+    if len(args) >= 4:
+        m2 = args[3].lower()
+        if m2 == "max":
+            height = 0
+        elif m2.isdigit():
+            height = int(m2)
 
-    await message.reply("Ок, качаю " + mode + "… это может занять минутку")
+    await message.reply("Ок, качаю " + ("аудио" if mode == "audio" else "видео") + ": качество = " + ("MAX" if height == 0 else str(height)))
 
     with tempfile.TemporaryDirectory() as td:
         workdir = Path(td)
@@ -286,17 +300,25 @@ async def cmd_get(message: Message):
 
         out_path = dl.path
 
-        # shrink if needed
+        # When MAX quality requested (height == 0), do NOT shrink — ZIP if too big
         try:
             if mode == "video" and sizeof_mb(out_path) > TARGET_MB:
-                smaller = workdir / (out_path.stem + ".small.mp4")
-                ok = await shrink_video(out_path, smaller, target_mb=TARGET_MB, height=min(height, 360))
-                if ok and sizeof_mb(smaller) < sizeof_mb(out_path):
-                    out_path = smaller
+                if height == 0:
+                    await message.reply("Файл большой. Упаковываю в ZIP…")
+                    parts = make_zip_parts([(out_path, dl.title)], workdir, part_mb=ARCHIVE_PART_MB)
+                    for i, z in enumerate(parts, 1):
+                        cap = "Часть " + str(i) + "/" + str(len(parts)) + ": " + z.name
+                        await message.answer_document(FSInputFile(str(z)), caption=cap)
+                    return
+                else:
+                    smaller = workdir / (out_path.stem + ".small.mp4")
+                    ok = await shrink_video(out_path, smaller, target_mb=TARGET_MB, height=min(height, 360) if height > 0 else 360)
+                    if ok and sizeof_mb(smaller) < sizeof_mb(out_path):
+                        out_path = smaller
         except Exception:
             pass
 
-        # send back (NO multiline strings)
+        # send back (single line caption)
         try:
             caption = str(dl.title) + " (через yt-dlp)"
             file = FSInputFile(str(out_path))
@@ -351,7 +373,7 @@ async def cmd_getall(message: Message):
     args = (message.text or "").split()
     if len(args) < 2:
         await message.reply(
-            "Использование: /getall <ссылка на канал/плейлист> [video|audio] [360|480|720|1080] [limit=ALL|N] [archive]"
+            "Использование: /getall <ссылка на канал/плейлист> [video|audio] [360|480|720|1080|max] [limit=ALL|N] [archive]"
         )
         return
 
@@ -361,7 +383,7 @@ async def cmd_getall(message: Message):
         return
 
     mode = "video"
-    height = DEFAULT_HEIGHT
+    height = DEFAULT_HEIGHT  # 0 => MAX
     limit: Optional[int] = 10
     do_archive = False
 
@@ -369,6 +391,8 @@ async def cmd_getall(message: Message):
         t = token.lower()
         if t in {"video", "audio"}:
             mode = t
+        elif t == "max":
+            height = 0
         elif t.isdigit():
             height = int(t)
         elif t.startswith("limit="):
@@ -383,9 +407,14 @@ async def cmd_getall(message: Message):
         elif t == "noarchive":
             do_archive = False
 
+    # If user wants MAX quality for bulk, archive by default (files likely huge)
+    if height == 0:
+        do_archive = True
+
     await message.reply(
-        "Собираю список… limit=" + ("ALL" if (limit is None) else str(limit))
-        + " | archive=" + ("ON" if do_archive else "OFF")
+        "Собираю список… limit=" + ("ALL" if (limit is None) else str(limit)) +
+        " | quality=" + ("MAX" if height == 0 else str(height)) +
+        " | archive=" + ("ON" if do_archive else "OFF")
     )
 
     try:
@@ -402,24 +431,44 @@ async def cmd_getall(message: Message):
     total = len(urls)
     await message.reply("Нашёл " + str(total) + " видео. Начинаю скачивание…")
 
-    files_for_zip: List[Tuple[Path, str]] = []
+    # persistent temp dir for whole batch (fixes FileNotFoundError when archiving)
+    with tempfile.TemporaryDirectory() as session_td:
+        session_dir = Path(session_td)
+        bundle_dir = session_dir / "bundle"
+        if do_archive:
+            bundle_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx, watch_url in enumerate(urls, 1):
-        try:
-            note = await message.answer(str(idx) + "/" + str(total) + " — скачиваю…")
-            with tempfile.TemporaryDirectory() as td:
-                workdir = Path(td)
+        files_for_zip: List[Tuple[Path, str]] = []
+
+        for idx, watch_url in enumerate(urls, 1):
+            try:
+                note = await message.answer(str(idx) + "/" + str(total) + " — скачиваю…")
+
+                # choose working directory per item
+                if do_archive:
+                    workdir = bundle_dir
+                else:
+                    td = tempfile.TemporaryDirectory()
+                    workdir = Path(td.name)
+
                 try:
                     dl = await asyncio.to_thread(ytdlp_download, watch_url, mode, height, workdir)
                 except Exception as e:
                     await note.edit_text(str(idx) + "/" + str(total) + " — ошибка скачивания: " + str(e))
+                    if not do_archive:
+                        try:
+                            td.cleanup()  # type: ignore
+                        except Exception:
+                            pass
                     continue
 
                 out_path = dl.path
+
+                # shrink only if not archiving and not MAX quality
                 try:
-                    if mode == "video" and sizeof_mb(out_path) > TARGET_MB:
+                    if (not do_archive) and mode == "video" and sizeof_mb(out_path) > TARGET_MB and height != 0:
                         smaller = workdir / (out_path.stem + ".small.mp4")
-                        ok = await shrink_video(out_path, smaller, target_mb=TARGET_MB, height=min(height, 360))
+                        ok = await shrink_video(out_path, smaller, target_mb=TARGET_MB, height=min(height, 360) if height > 0 else 360)
                         if ok and sizeof_mb(smaller) < sizeof_mb(out_path):
                             out_path = smaller
                 except Exception:
@@ -438,25 +487,29 @@ async def cmd_getall(message: Message):
                     except Exception as e:
                         await note.edit_text(str(idx) + "/" + str(total) + " — не удалось отправить файл: " + str(e))
 
-            await asyncio.sleep(1.2)
-        except Exception:
-            continue
+                # cleanup per-item temp if used
+                if not do_archive:
+                    try:
+                        td.cleanup()  # type: ignore
+                    except Exception:
+                        pass
 
-    if do_archive:
-        await message.reply("Формирую ZIP-архивы…")
-        with tempfile.TemporaryDirectory() as zd:
-            zdir = Path(zd)
-            parts = make_zip_parts(files_for_zip, zdir, part_mb=ARCHIVE_PART_MB)
+                await asyncio.sleep(1.0)
+            except Exception:
+                continue
+
+        if do_archive:
+            await message.reply("Формирую ZIP-архивы…")
+            parts = make_zip_parts(files_for_zip, session_dir, part_mb=ARCHIVE_PART_MB)
             if not parts:
                 await message.reply("Нечего архивировать (список пуст).")
-                return
-            for i, z in enumerate(parts, 1):
-                try:
-                    cap = "Архив " + str(i) + "/" + str(len(parts)) + " — " + z.name
-                    await message.answer_document(FSInputFile(str(z)), caption=cap)
-                except Exception as e:
-                    await message.answer("Не удалось отправить архив " + z.name + ": " + str(e))
-        sent = len(files_for_zip)
+            else:
+                for i, z in enumerate(parts, 1):
+                    try:
+                        cap = "Архив " + str(i) + "/" + str(len(parts)) + " — " + z.name
+                        await message.answer_document(FSInputFile(str(z)), caption=cap)
+                    except Exception as e:
+                        await message.answer("Не удалось отправить архив " + z.name + ": " + str(e))
 
     await message.reply("Готово. Обработано: " + str(sent if not do_archive else len(files_for_zip)) + " из " + str(total) + ".")
 
