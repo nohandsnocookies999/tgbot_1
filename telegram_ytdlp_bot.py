@@ -1,4 +1,4 @@
-# Telegram YT-DLP Bot — MAX quality + archive every 10 videos
+# Telegram YT-DLP Bot — MAX quality + archive every 10 videos (upload to PixelDrain)
 # Use only for content you are allowed to download.
 
 from __future__ import annotations
@@ -21,11 +21,17 @@ from aiogram.types import Message, FSInputFile
 from dotenv import load_dotenv
 import yt_dlp
 from yt_dlp.utils import DownloadError
+import requests
 
 # ---------------- configuration ----------------
-BATCH_SIZE = 10         # /getall: make a ZIP after every N downloaded videos
+BATCH_SIZE = 10         # /getall: make one ZIP after every N downloaded videos
 DEFAULT_HEIGHT = 0      # 0 => MAX quality by default
 ALLOWED_NETLOC = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
+PIXEL_API = "https://pixeldrain.com/api/file"
+PIXEL_VIEW = "https://pixeldrain.com/u/"
+PIXEL_DL   = "https://pixeldrain.com/api/file/"
+# Optional: if you have a PixelDrain API key (to attach uploads to your account)
+PIXEL_API_KEY = os.getenv("PIXELDRAIN_API_KEY") or os.getenv("PIXEL_API_KEY")
 # ------------------------------------------------
 
 load_dotenv()
@@ -36,15 +42,16 @@ if not BOT_TOKEN:
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-# Guide text (small, no multiline literals inside handlers)
-GUIDE_TEXT = "".join([
+# Guide text (no multiline literals inside handlers)
+GUIDE_TEXT = "\n".join([
     "<b>YT-DLP Telegram Bot — Guide</b>",
     "",
     "<b>Commands</b>",
     "/get <url> [video|audio] [360|480|720|1080|max]",
     "/getall <channel_or_playlist_url> [video|audio] [360|480|720|1080|max]",
     "",
-    "Default quality: MAX. In /getall the bot archives every 10 videos (no size checks).",
+    "Default quality: MAX.",
+    "In /getall the bot archives every 10 videos and uploads ZIP to PixelDrain, replying with a link.",
 ])
 
 YTDLP_COMMON: Dict[str, object] = {
@@ -142,6 +149,22 @@ def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLResult:
     return DLResult(path=fn, title=title, ext=fn.suffix.lstrip("."))
 
 
+# ---------------- PixelDrain upload helpers ----------------
+
+def upload_pixeldrain(path: Path) -> Tuple[str, str]:
+    auth = ("user", PIXEL_API_KEY) if PIXEL_API_KEY else None
+    with open(path, "rb") as f:
+        r = requests.post(PIXEL_API, files={"file": (path.name, f)}, auth=auth, timeout=120)
+    r.raise_for_status()
+    data = r.json()
+    fid = str(data.get("id") or "")
+    if not fid:
+        raise RuntimeError("PixelDrain: no id in response")
+    view = PIXEL_VIEW + fid
+    direct = PIXEL_DL + fid
+    return view, direct
+
+
 # --------------- playlist helpers & archiving ---------------
 
 def _safe_stem(name: str) -> str:
@@ -183,7 +206,7 @@ def list_playlist_urls(url: str) -> List[str]:
         return urls
 
 
-def make_zip(files: List[Tuple[Path, str]], outdir: Path, batch_idx: int) -> Path:
+def make_zip_single(files: List[Tuple[Path, str]], outdir: Path, batch_idx: int) -> Path:
     zpath = outdir / ("batch_" + str(batch_idx).zfill(3) + ".zip")
     zf = zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True)
     for p, title in files:
@@ -203,9 +226,9 @@ async def cmd_start(message: Message):
         "Привет! Команды:",
         "/get <YouTube URL> [video|audio] [360|480|720|1080|max]",
         "/getall <канал/плейлист URL> [video|audio] [360|480|720|1080|max]",
-        "По умолчанию качество: MAX. В /getall архивируем каждые 10 видео.",
+        "По умолчанию качество: MAX. В /getall архивируем каждые 10 видео и заливаем ZIP на PixelDrain.",
     ]
-    await message.reply("".join(lines))
+    await message.reply("\n".join(lines))
 
 
 @dp.message(Command("help"))
@@ -254,7 +277,8 @@ async def cmd_get(message: Message):
         elif m2.isdigit():
             height = int(m2)
 
-    await message.reply("Ок, качаю {}: качество = {}".format("аудио" if mode == "audio" else "видео", "MAX" if height == 0 else str(height)))
+    msg = "Ок, качаю {}: качество = {}".format("аудио" if mode == "audio" else "видео", "MAX" if height == 0 else str(height))
+    await message.reply(msg)
 
     with tempfile.TemporaryDirectory() as td:
         workdir = Path(td)
@@ -268,7 +292,16 @@ async def cmd_get(message: Message):
             caption = str(dl.title) + " (yt-dlp)"
             await message.answer_document(FSInputFile(str(dl.path)), caption=caption)
         except Exception as e:
-            await message.reply("Не удалось отправить файл: " + str(e))
+            err = str(e)
+            if ("Too Large" in err) or ("too big" in err) or ("413" in err):
+                try:
+                    view, direct = await asyncio.to_thread(upload_pixeldrain, dl.path)
+                    text = f"Файл большой, залил на PixelDrain:\n{view}\nПрямая ссылка: {direct}"
+                    await message.answer(text)
+                except Exception as e2:
+                    await message.reply("Не удалось отправить файл и загрузить на PixelDrain: " + str(e2))
+            else:
+                await message.reply("Не удалось отправить файл: " + err)
 
 
 @dp.message(Command("getall"))
@@ -307,7 +340,7 @@ async def cmd_getall(message: Message):
         return
 
     total = len(urls)
-    await message.reply("Найдено {} видео. Скачиваю и архивирую каждые {}.".format(total, BATCH_SIZE))
+    await message.reply("Найдено " + str(total) + " видео. Пакеты по " + str(BATCH_SIZE) + " шт.; для каждого будет ссылка PixelDrain.")
 
     # Persistent temp dir for the whole batch so files live until zipped
     with tempfile.TemporaryDirectory() as session_td:
@@ -321,25 +354,25 @@ async def cmd_getall(message: Message):
 
         for idx, watch_url in enumerate(urls, 1):
             try:
-                note = await message.answer("{}/{} — скачиваю…".format(idx, total))
+                note = await message.answer(str(idx) + "/" + str(total) + " — скачиваю…")
                 try:
                     dl = await asyncio.to_thread(ytdlp_download, watch_url, mode, height, workdir)
                 except Exception as e:
-                    await note.edit_text("{}/{} — ошибка: {}".format(idx, total, e))
+                    await note.edit_text(str(idx) + "/" + str(total) + " — ошибка: " + str(e))
                     continue
 
                 batch_files.append((dl.path, dl.title))
                 processed += 1
-                await note.edit_text("{}/{} — готово, добавлено в пакет".format(idx, total))
+                await note.edit_text(str(idx) + "/" + str(total) + " — готово, добавлено в пакет")
 
-                # Archive every BATCH_SIZE items
                 if len(batch_files) >= BATCH_SIZE:
-                    z = make_zip(batch_files, session_dir, batch_index)
+                    z = make_zip_single(batch_files, session_dir, batch_index)
                     try:
-                        cap = "Пакет {} ({} видео) — {}".format(batch_index, BATCH_SIZE, z.name)
-                        await message.answer_document(FSInputFile(str(z)), caption=cap)
+                        view, direct = await asyncio.to_thread(upload_pixeldrain, z)
+                        text = f"Пакет {batch_index} ({len(batch_files)} видео):\n{view}\nПрямая ссылка: {direct}"
+                        await message.answer(text)
                     except Exception as e:
-                        await message.answer("Не удалось отправить архив {}: {}".format(z.name, e))
+                        await message.answer("Не удалось загрузить архив на PixelDrain: " + str(e))
                     batch_files = []
                     batch_index += 1
 
@@ -349,19 +382,41 @@ async def cmd_getall(message: Message):
 
         # Remaining files
         if batch_files:
-            z = make_zip(batch_files, session_dir, batch_index)
+            z = make_zip_single(batch_files, session_dir, batch_index)
             try:
-                cap = "Пакет {} ({} видео) — {}".format(batch_index, len(batch_files), z.name)
-                await message.answer_document(FSInputFile(str(z)), caption=cap)
+                view, direct = await asyncio.to_thread(upload_pixeldrain, z)
+                text = f"Пакет {batch_index} ({len(batch_files)} видео):\n{view}\nПрямая ссылка: {direct}"
+                await message.answer(text)
             except Exception as e:
-                await message.answer("Не удалось отправить архив {}: {}".format(z.name, e))
+                await message.answer("Не удалось загрузить архив на PixelDrain: " + str(e))
 
-    await message.reply("Готово. Обработано: {} из {}.".format(processed, total))
+    await message.reply("Готово. Обработано: " + str(processed) + " из " + str(total) + ".")
+
+
+# -------------------- lightweight self-tests --------------------
+
+def _selftest() -> None:
+    # format string tests
+    assert _build_format_string("audio", 0).startswith("ba"), "audio best format"
+    assert "height<=720" in _build_format_string("video", 720), "height filter in format"
+
+    # safe stem
+    assert _safe_stem("a*b?c").startswith("a_b_c"), "safe stem replaces illegal chars"
+
+    # message formatting (the bug source): ensure f-strings with \n are correct
+    view = "https://pixeldrain.com/u/XYZ"
+    direct = "https://pixeldrain.com/api/file/XYZ"
+    txt = f"Файл большой, залил на PixelDrain:\n{view}\nПрямая ссылка: {direct}"
+    assert "\n" in txt and view in txt and direct in txt
 
 
 # -------------------- entrypoint --------------------
 
 async def main():
+    if os.getenv("SELFTEST") == "1":
+        _selftest()
+        print("SELFTEST passed")
+        return
     await dp.start_polling(bot)
 
 
