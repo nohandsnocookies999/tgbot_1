@@ -205,8 +205,7 @@ async def cmd_start(message: Message):
         "/getall <канал/плейлист URL> [video|audio] [360|480|720|1080|max]",
         "По умолчанию качество: MAX. В /getall архивируем каждые 10 видео.",
     ]
-    await message.reply("
-".join(lines))
+    await message.reply("".join(lines))
 
 
 @dp.message(Command("help"))
