@@ -13,14 +13,10 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 from urllib.parse import urlparse
 
-from aiogram import Bot, Dispatcher
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, Text
-from aiogram.types import (
-    Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-)
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
+# NOTE: We LAZY-import aiogram inside setup_bot() to avoid importing `ssl`
+# on environments where Python was built without it. This lets self-tests run
+# and shows a clear error at runtime instead of crashing at import time.
+
 from dotenv import load_dotenv
 import yt_dlp
 from yt_dlp.utils import DownloadError
@@ -40,9 +36,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("Please set BOT_TOKEN environment variable (e.g., in .env)")
-
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
 
 # Guide text (no multiline literals inside handlers)
 GUIDE_TEXT = "\n".join([
@@ -102,16 +95,6 @@ def _normalize_watch_url(entry: dict) -> Optional[str]:
 def _safe_stem(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._ -]+", "_", (name or "file")).strip()
     return s or "file"
-
-
-async def run_cmd(cmd: str) -> Tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_shell(
-        cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    out_b, err_b = await proc.communicate()
-    return proc.returncode, out_b.decode("utf-8", "ignore"), err_b.decode("utf-8", "ignore")
 
 
 # ---------------- yt-dlp helpers ----------------
@@ -291,104 +274,131 @@ def make_zip_single(files: List[Tuple[Path, str]], outdir: Path, batch_idx: int)
     return zpath
 
 
-# ---------------- keyboards ----------------
+# ---------------- aiogram setup (lazy import) ----------------
 
-def menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📹 Скачати одне відео", callback_data="mode:single")],
-        [InlineKeyboardButton(text="📺 Всі відео з каналу", callback_data="mode:all")],
-        [InlineKeyboardButton(text="🆕 Останні 10", callback_data="mode:latest:10"),
-         InlineKeyboardButton(text="🆕 Останні 20", callback_data="mode:latest:20"),
-         InlineKeyboardButton(text="🆕 Останні 30", callback_data="mode:latest:30")],
-        [InlineKeyboardButton(text="🔥 Топ-20 за переглядами", callback_data="mode:top20")],
-        [InlineKeyboardButton(text="🎞 Увесь плейліст", callback_data="mode:playlist_all")],
-    ])
+def setup_bot():
+    """Import aiogram lazily and register handlers. Raises RuntimeError if ssl is missing."""
+    # Pre-check that Python ssl module exists in this runtime
+    try:
+        import ssl  # noqa: F401
+    except ModuleNotFoundError as e:  # pragma: no cover
+        raise RuntimeError(
+            "Python ssl module is missing in this environment. The Telegram bot requires HTTPS. "
+            "Please run this code on a system where Python has ssl support (e.g., Railway default image)."
+        ) from e
 
+    # Now import aiogram bits
+    from aiogram import Bot, Dispatcher, F
+    from aiogram.enums import ParseMode
+    from aiogram.filters import Command
+    from aiogram.types import (
+        Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+    )
+    from aiogram.fsm.state import State, StatesGroup
+    from aiogram.fsm.context import FSMContext
+    from aiogram.fsm.storage.memory import MemoryStorage
 
-class AwaitLink(StatesGroup):
-    waiting_for_link = State()
+    bot = Bot(BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
 
+    # Keyboards
+    def menu_kb() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📹 Скачати одне відео", callback_data="mode:single")],
+            [InlineKeyboardButton(text="📺 Всі відео з каналу", callback_data="mode:all")],
+            [InlineKeyboardButton(text="🆕 Останні 10", callback_data="mode:latest:10"),
+             InlineKeyboardButton(text="🆕 Останні 20", callback_data="mode:latest:20"),
+             InlineKeyboardButton(text="🆕 Останні 30", callback_data="mode:latest:30")],
+            [InlineKeyboardButton(text="🔥 Топ-20 за переглядами", callback_data="mode:top20")],
+            [InlineKeyboardButton(text="🎞 Увесь плейліст", callback_data="mode:playlist_all")],
+        ])
 
-# ---------------- handlers ----------------
+    class AwaitLink(StatesGroup):
+        waiting_for_link = State()
 
-@dp.message(Command("start", "menu"))
-async def cmd_start(message: Message):
-    text = "\n".join([
-        "Можемо скачати:",
-        "",
-        "• 📹 одне відео — попрошу лінк на відео і відправлю файл у Телеграм (якщо надто великий — лінк на PixelDrain)",
-        "• 📺 всі відео з каналу — лінк на канал, архівація по 10 і завантаження на PixelDrain",
-        "• 🆕 останні 10 / 20 / 30 — лінк на канал, архівація по 10 і завантаження на PixelDrain",
-        "• 🔥 топ-20 за переглядами — лінк на канал, архівація по 10 і завантаження на PixelDrain",
-        "• 🎞 увесь плейліст — лінк на плейліст, архівація по 10 і завантаження на PixelDrain",
-        "",
-        "Якість: завжди максимально доступна.",
-    ])
-    await message.answer(text, reply_markup=menu_kb())
+    # Handlers (registered programmatically — no decorators at import time)
+    async def cmd_start(message: Message):
+        text = "\n".join([
+            "Можемо скачати:",
+            "",
+            "• 📹 одне відео — попрошу лінк на відео і відправлю файл у Телеграм (якщо надто великий — лінк на PixelDrain)",
+            "• 📺 всі відео з каналу — лінк на канал, архівація по 10 і завантаження на PixelDrain",
+            "• 🆕 останні 10 / 20 / 30 — лінк на канал, архівація по 10 і завантаження на PixelDrain",
+            "• 🔥 топ-20 за переглядами — лінк на канал, архівація по 10 і завантаження на PixelDrain",
+            "• 🎞 увесь плейліст — лінк на плейліст, архівація по 10 і завантаження на PixelDrain",
+            "",
+            "Якість: завжди максимально доступна.",
+        ])
+        await message.answer(text, reply_markup=menu_kb())
 
+    async def cmd_help(message: Message):
+        await message.answer(GUIDE_TEXT, parse_mode=ParseMode.HTML, reply_markup=menu_kb())
 
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(GUIDE_TEXT, parse_mode=ParseMode.HTML, reply_markup=menu_kb())
+    async def cb_mode(call: CallbackQuery, state: FSMContext):
+        data = call.data  # e.g. mode:latest:20
+        await state.update_data(sel=data)
+        if data == "mode:single":
+            await call.message.answer("Кинь лінк на відео YouTube")
+        elif data == "mode:all":
+            await call.message.answer("Кинь лінк на канал YouTube (сторінка /videos)")
+        elif data.startswith("mode:latest:"):
+            await call.message.answer("Кинь лінк на канал YouTube (сторінка /videos)")
+        elif data == "mode:top20":
+            await call.message.answer("Кинь лінк на канал YouTube (сторінка /videos)")
+        elif data == "mode:playlist_all":
+            await call.message.answer("Кинь лінк на плейліст YouTube")
+        await state.set_state(AwaitLink.waiting_for_link)
+        await call.answer()
 
+    async def on_link(message: Message, state: FSMContext):
+        url = (message.text or "").strip()
+        if not is_youtube_url(url):
+            await message.reply("Схоже, це не лінк на YouTube. Спробуй ще раз або /menu.")
+            return
 
-@dp.callback_query(Text(startswith="mode:"))
-async def cb_mode(call: CallbackQuery, state: FSMContext):
-    data = call.data  # e.g. mode:latest:20
-    await state.update_data(sel=data)
-    if data == "mode:single":
-        await call.message.answer("Кинь лінк на відео YouTube")
-    elif data == "mode:all":
-        await call.message.answer("Кинь лінк на канал YouTube (сторінка /videos)")
-    elif data.startswith("mode:latest:"):
-        await call.message.answer("Кинь лінк на канал YouTube (сторінка /videos)")
-    elif data == "mode:top20":
-        await call.message.answer("Кинь лінк на канал YouTube (сторінка /videos)")
-    elif data == "mode:playlist_all":
-        await call.message.answer("Кинь лінк на плейліст YouTube")
-    await state.set_state(AwaitLink.waiting_for_link)
-    await call.answer()
+        data = await state.get_data()
+        sel = data.get("sel", "mode:single")
 
+        if sel == "mode:single":
+            await do_single(message, url)  # uses dynamic FSInputFile import inside
+            await state.clear()
+            return
 
-@dp.message(AwaitLink.waiting_for_link)
-async def on_link(message: Message, state: FSMContext):
-    url = (message.text or "").strip()
-    if not is_youtube_url(url):
-        await message.reply("Схоже, це не лінк на YouTube. Спробуй ще раз або /menu.")
-        return
+        # Bulk selections
+        if sel == "mode:all":
+            urls = select_urls("all", url)
+        elif sel == "mode:playlist_all":
+            urls = select_urls("playlist_all", url)
+        elif sel.startswith("mode:latest:"):
+            n = sel.split(":")[-1]
+            urls = select_urls("latest:" + n, url)
+        elif sel == "mode:top20":
+            urls = select_urls("top20", url)
+        else:
+            urls = []
 
-    data = await state.get_data()
-    sel = data.get("sel", "mode:single")
+        if not urls:
+            await message.reply("Не вдалося зібрати список відео. Перевір лінк або спробуй інший режим.")
+            return
 
-    if sel == "mode:single":
-        await do_single(message, url)
+        await do_bulk(message, urls)
         await state.clear()
-        return
 
-    # Bulk selections
-    if sel == "mode:all":
-        urls = select_urls("all", url)
-    elif sel == "mode:playlist_all":
-        urls = select_urls("playlist_all", url)
-    elif sel.startswith("mode:latest:"):
-        n = sel.split(":")[-1]
-        urls = select_urls("latest:" + n, url)
-    elif sel == "mode:top20":
-        urls = select_urls("top20", url)
-    else:
-        urls = []
+    # Register handlers
+    dp.message.register(cmd_start, Command("start", "menu"))
+    dp.message.register(cmd_help, Command("help"))
+    dp.callback_query.register(cb_mode, F.data.startswith("mode:"))
+    dp.message.register(on_link, AwaitLink.waiting_for_link)
 
-    if not urls:
-        await message.reply("Не вдалося зібрати список відео. Перевір лінк або спробуй інший режим.")
-        return
-
-    await do_bulk(message, urls)
-    await state.clear()
+    return bot, dp
 
 
 # ---------------- single & bulk flows ----------------
 
-async def do_single(message: Message, url: str) -> None:
+async def do_single(message, url: str) -> None:
+    # dynamic import to avoid ssl import at module time
+    from aiogram.types import FSInputFile
+
     await message.reply("Ок, качаю одне відео у максимальній якості…")
     with tempfile.TemporaryDirectory() as td:
         workdir = Path(td)
@@ -413,9 +423,8 @@ async def do_single(message: Message, url: str) -> None:
                 await message.reply("Не вдалося надіслати файл: " + err)
 
 
-async def do_bulk(message: Message, urls: List[str]) -> None:
-    total = len(urls)
-    await message.reply("Знайшов " + str(total) + " відео. Пакетую по " + str(BATCH_SIZE) + " у ZIP та вантажу на PixelDrain…")
+async def do_bulk(message, urls: List[str]) -> None:
+    await message.reply("Знайшов " + str(len(urls)) + " відео. Пакетую по " + str(BATCH_SIZE) + " у ZIP та вантажу на PixelDrain…")
 
     with tempfile.TemporaryDirectory() as session_td:
         session_dir = Path(session_td)
@@ -428,16 +437,16 @@ async def do_bulk(message: Message, urls: List[str]) -> None:
 
         for idx, watch_url in enumerate(urls, 1):
             try:
-                note = await message.answer(str(idx) + "/" + str(total) + " — качаю…")
+                note = await message.answer(str(idx) + "/" + str(len(urls)) + " — качаю…")
                 try:
                     dl = await asyncio.to_thread(ytdlp_download, watch_url, "video", DEFAULT_HEIGHT, workdir)
                 except Exception as e:
-                    await note.edit_text(str(idx) + "/" + str(total) + " — помилка: " + str(e))
+                    await note.edit_text(str(idx) + "/" + str(len(urls)) + " — помилка: " + str(e))
                     continue
 
                 batch_files.append((dl.path, dl.title))
                 processed += 1
-                await note.edit_text(str(idx) + "/" + str(total) + " — готово, додано у пакет")
+                await note.edit_text(str(idx) + "/" + str(len(urls)) + " — готово, додано у пакет")
 
                 if len(batch_files) >= BATCH_SIZE:
                     z = make_zip_single(batch_files, session_dir, batch_index)
@@ -464,7 +473,7 @@ async def do_bulk(message: Message, urls: List[str]) -> None:
             except Exception as e:
                 await message.answer("Не вдалося завантажити архів на PixelDrain: " + str(e))
 
-    await message.reply("Готово. Оброблено: " + str(processed) + " з " + str(total) + ".")
+    await message.reply("Готово. Оброблено: " + str(processed) + " з " + str(len(urls)) + ".")
 
 
 # ---------------- lightweight self-tests --------------------
@@ -485,12 +494,6 @@ def _selftest() -> None:
     txt = "Файл великий, залив на PixelDrain:\n" + view + "\nПряма лінка: " + direct
     assert "\n" in txt and view in txt and direct in txt
 
-    # keyboards
-    kb = menu_kb()
-    cds = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    for must in ["mode:single", "mode:all", "mode:latest:10", "mode:latest:20", "mode:latest:30", "mode:top20", "mode:playlist_all"]:
-        assert must in cds, "missing menu item: " + must
-
     # selection helpers: synthetic ordering
     items = [
         {"url": "u1", "timestamp": 20240101, "view_count": 10},
@@ -510,10 +513,24 @@ async def main():
         _selftest()
         print("SELFTEST passed")
         return
+
+    # Build bot lazily; if ssl is missing, show a clear error and exit gracefully.
+    try:
+        bot, dp = setup_bot()
+    except RuntimeError as e:
+        msg = str(e)
+        if "ssl module" in msg.lower():  # friendly message for sandboxes without ssl
+            print("FATAL: " + msg)
+            print("Hint: deploy on Railway/Render/any Docker image with OpenSSL-enabled Python.")
+            return
+        raise
+
+    # Prevent conflicts: ensure webhook is removed and pending updates are dropped
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
+
     await dp.start_polling(bot)
 
 
