@@ -319,21 +319,19 @@ async def cmd_get(message: Message):
         except Exception:
             pass
 
-        # send back
-        try:
-            caption = "{}
-(через yt-dlp)".format(dl.title)
-            file = FSInputFile(str(out_path))
-            await message.answer_document(file, caption=caption)
-        except Exception as e:
-            size = sizeof_mb(out_path)
-            msg = (
-                "Не удалось отправить файл. "
-                f"Размер: {size:.1f} MB. Попробуй /get <url> video 360 или аудио.
-"
-                f"Тех. причина: {e}"
-            )
-            await message.reply(msg)
+       # send back
+try:
+    caption = "{}\\n(через yt-dlp)".format(dl.title)  # <- тут саме \n, не реальний перенос!
+    file = FSInputFile(str(out_path))
+    await message.answer_document(file, caption=caption)
+except Exception as e:
+    size = sizeof_mb(out_path)
+    msg = (
+        "Не удалось отправить файл. "
+        f"Размер: {size:.1f} MB. Попробуй /get <url> video 360 или аудио.\n"
+        f"Тех. причина: {e}"
+    )
+    await message.reply(msg)
 
 
 # ------------- bulk channel/playlist support -------------
