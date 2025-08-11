@@ -321,10 +321,10 @@ async def cmd_get(message: Message):
             pass
 
        # send back
+# send back
 try:
-    caption = str(dl.title) + " (через yt-dlp)"   # один рядок, без \n
     file = FSInputFile(str(out_path))
-    await message.answer_document(file, caption=caption)
+    await message.answer_document(file)  # без caption
 except Exception as e:
     size = sizeof_mb(out_path)
     msg = "Не удалось отправить файл. Размер: " + "{:.1f}".format(size) + \
