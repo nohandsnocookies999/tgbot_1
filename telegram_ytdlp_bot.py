@@ -17,15 +17,18 @@ Commands
 /start  — brief help
 /help   — inline guide
 /guide  — guide as HTML file
-/get <url> [video|audio] [360|480|720]
-/getall <channel_or_playlist_url> [video|audio] [360|480|720] [limit=ALL|N]
+/get <url> [video|audio] [360|480|720|1080]
+/getall <channel_or_playlist_url> [video|audio] [360|480|720|1080] [limit=ALL|N] [archive]
+• If you set limit=ALL, the bot will <archive> results automatically (multi-part ZIPs ≤ ~49 MB each).
 """
 from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -40,6 +43,7 @@ import yt_dlp
 
 # ---------------- configuration ----------------
 TARGET_MB = 49          # try to keep Telegram Bot API-friendly
+ARCHIVE_PART_MB = 47    # per ZIP part when archiving (leave headroom)
 DEFAULT_HEIGHT = 480    # default max height for video
 ALLOWED_NETLOC = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
 # ------------------------------------------------
@@ -57,12 +61,13 @@ GUIDE_TEXT = (
 <b>YT-DLP Telegram Bot — Guide</b>
 
 <b>What it does</b>
-• /get &lt;url&gt; [video|audio] [360|480|720] — download single video or audio
-• /getall &lt;channel_or_playlist_url&gt; [video|audio] [360|480|720] [limit=ALL|N] — bulk from channel/playlist
+• /get &lt;url&gt; [video|audio] [360|480|720|1080] — download single video or audio
+• /getall &lt;channel_or_playlist_url&gt; [video|audio] [360|480|720|1080] [limit=ALL|N] [archive] — bulk
 
 <b>Tips</b>
 • For channels use the /videos URL (e.g. https://www.youtube.com/@YourChannel/videos)
 • If a file is large, the bot will try to shrink to ~49 MB. For reliability use “video 360”.
+• When you use <code>limit=ALL</code>, the bot will automatically create multi‑part ZIP archives (≤ ~49 MB each). You can also force archiving by adding the word <code>archive</code>.
 • Download only content you have rights to.
 
 <b>Telegram limits</b>
@@ -188,10 +193,49 @@ def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLResult:
         if "requested_downloads" in info and info["requested_downloads"]:
             fn = Path(info["requested_downloads"][0]["filepath"])
         else:
-            # fallback guess
             fn = Path(ydl.prepare_filename(info)).with_suffix(".mp3" if mode == "audio" else ".mp4")
         title = info.get("title", fn.stem)
         return DLResult(path=fn, title=title, ext=fn.suffix.lstrip("."))
+
+
+# -------------------- archiving helpers --------------------
+
+def _safe_stem(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._ -]+", "_", name or "file").strip()
+    return s or "file"
+
+
+def make_zip_parts(files: list[tuple[Path, str]], outdir: Path, part_mb: int = ARCHIVE_PART_MB) -> list[Path]:
+    """Create multi-part ZIPs (ZIP_STORED) about <= part_mb each.
+    files: list of (path, title)
+    Returns list of zip paths in order.
+    """
+    parts: list[Path] = []
+    if not files:
+        return parts
+
+    part_bytes = part_mb * 1024 * 1024
+    part_idx = 1
+    current_size = 0
+    zpath = outdir / f"bundle_part{part_idx:02d}.zip"
+    zf = zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_STORED)
+
+    for p, title in files:
+        sz = p.stat().st_size
+        if current_size > 0 and (current_size + sz) > part_bytes:
+            zf.close()
+            parts.append(zpath)
+            part_idx += 1
+            zpath = outdir / f"bundle_part{part_idx:02d}.zip"
+            zf = zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_STORED)
+            current_size = 0
+        arcname = f"{_safe_stem(title)}{p.suffix.lower()}"
+        zf.write(p, arcname=arcname)
+        current_size += sz
+
+    zf.close()
+    parts.append(zpath)
+    return parts
 
 
 # -------------------- Telegram handlers --------------------
@@ -199,7 +243,7 @@ def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLResult:
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     text = """Привет! Пришли команду в формате:
-/get <YouTube URL> [video|audio] [360|480|720]
+/get <YouTube URL> [video|audio] [360|480|720|1080]
 
 Например:
 /get https://youtu.be/dQw4w9WgXcQ
@@ -277,14 +321,16 @@ async def cmd_get(message: Message):
 
         # send back
         try:
-            caption = "{}\n(через yt-dlp)".format(dl.title)
+            caption = "{}
+(через yt-dlp)".format(dl.title)
             file = FSInputFile(str(out_path))
             await message.answer_document(file, caption=caption)
         except Exception as e:
             size = sizeof_mb(out_path)
             msg = (
                 "Не удалось отправить файл. "
-                f"Размер: {size:.1f} MB. Попробуй /get <url> video 360 или аудио.\n"
+                f"Размер: {size:.1f} MB. Попробуй /get <url> video 360 или аудио.
+"
                 f"Тех. причина: {e}"
             )
             await message.reply(msg)
@@ -339,12 +385,16 @@ async def cmd_getall(message: Message):
     Download and send multiple videos from a channel/playlist.
 
     Usage:
-      /getall <channel_or_playlist_url> [video|audio] [360|480|720] [limit=ALL|N]
+      /getall <channel_or_playlist_url> [video|audio] [360|480|720|1080] [limit=ALL|N] [archive]
+
+    Notes:
+      • По умолчанию скачиваем первые 10, чтобы не заспамить чат. Укажи limit=ALL, чтобы взять все.
+      • Если limit=ALL, бот автоматически сформирует ZIP‑архивы (частями ≤ ~49 MB). Можно также принудительно включить архивирование словом "archive".
     """
     args = (message.text or "").split()
     if len(args) < 2:
         await message.reply(
-            "Использование: /getall <ссылка на канал/плейлист> [video|audio] [360|480|720] [limit=ALL|N]"
+            "Использование: /getall <ссылка на канал/плейлист> [video|audio] [360|480|720|1080] [limit=ALL|N] [archive]"
         )
         return
 
@@ -356,6 +406,7 @@ async def cmd_getall(message: Message):
     mode = "video"
     height = DEFAULT_HEIGHT
     limit: Optional[int] = 10  # default to first 10
+    do_archive = False
 
     for token in args[2:]:
         t = token.lower()
@@ -367,10 +418,15 @@ async def cmd_getall(message: Message):
             val = t.split("=", 1)[1]
             if val == "all":
                 limit = None
+                do_archive = True
             elif val.isdigit():
                 limit = int(val)
+        elif t == "archive":
+            do_archive = True
+        elif t == "noarchive":
+            do_archive = False
 
-    await message.reply(f"Собираю список… limit={limit or 'ALL'}")
+    await message.reply(f"Собираю список… limit={limit or 'ALL'} | archive={'ON' if do_archive else 'OFF'}")
 
     try:
         urls = await asyncio.to_thread(list_playlist_urls, url, limit)
@@ -384,7 +440,9 @@ async def cmd_getall(message: Message):
 
     sent = 0
     total = len(urls)
-    await message.reply(f"Нашёл {total} видео. Начинаю отправку…")
+    await message.reply(f"Нашёл {total} видео. Начинаю скачивание…")
+
+    files_for_zip: list[tuple[Path, str]] = []
 
     for idx, watch_url in enumerate(urls, 1):
         try:
@@ -407,21 +465,42 @@ async def cmd_getall(message: Message):
                 except Exception:
                     pass
 
-                try:
-                    caption = "{}\n(через yt-dlp)".format(dl.title)
-                    file = FSInputFile(str(out_path))
-                    await message.answer_document(file, caption=caption)
-                    sent += 1
-                    await note.edit_text(f"{idx}/{total} — готово ✅")
-                except Exception as e:
-                    await note.edit_text(f"{idx}/{total} — не удалось отправить файл: {e}")
+                if do_archive:
+                    # save for later archiving
+                    files_for_zip.append((out_path, dl.title))
+                    await note.edit_text(f"{idx}/{total} — готово (в архив)")
+                else:
+                    try:
+                        caption = "{}
+(через yt-dlp)".format(dl.title)
+                        file = FSInputFile(str(out_path))
+                        await message.answer_document(file, caption=caption)
+                        sent += 1
+                        await note.edit_text(f"{idx}/{total} — готово ✅")
+                    except Exception as e:
+                        await note.edit_text(f"{idx}/{total} — не удалось отправить файл: {e}")
 
-            await asyncio.sleep(1.2)  # small pause to be gentle to limits
+            await asyncio.sleep(1.2)  # gentle on limits
         except Exception:
-            # continue with next video even if this iteration failed
             continue
 
-    await message.reply(f"Готово. Отправлено: {sent} из {total}.")
+    if do_archive:
+        await message.reply("Формирую ZIP‑архивы…")
+        with tempfile.TemporaryDirectory() as zd:
+            zdir = Path(zd)
+            parts = make_zip_parts(files_for_zip, zdir, part_mb=ARCHIVE_PART_MB)
+            if not parts:
+                await message.reply("Нечего архивировать (список пуст).")
+                return
+            for i, z in enumerate(parts, 1):
+                try:
+                    cap = f"Архив {i}/{len(parts)} — {z.name}"
+                    await message.answer_document(FSInputFile(str(z)), caption=cap)
+                except Exception as e:
+                    await message.answer(f"Не удалось отправить архив {z.name}: {e}")
+        sent = len(files_for_zip)
+
+    await message.reply(f"Готово. Обработано: {sent if not do_archive else len(files_for_zip)} из {total}.")
 
 
 # -------------------- entrypoint --------------------
