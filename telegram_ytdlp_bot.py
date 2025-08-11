@@ -5,36 +5,23 @@ and sends them back in chat.
 ⚠️ Use only for content you own or have permission to download.
    Respect YouTube's Terms of Service and your local laws.
 
-Quick start
------------
-1) Python 3.10+
-2) Install system ffmpeg (required by yt-dlp for muxing/transcoding)
-3) pip install -r requirements OR minimal:
-   pip install aiogram==3.* yt-dlp==2025.* python-dotenv==1.*
-4) Create .env next to this file:
-   BOT_TOKEN=123456:ABC...
-5) Run:  python telegram_ytdlp_bot.py
+Quick start (local or in Docker)
+--------------------------------
+1) Have Python 3.10+ and ffmpeg installed (Dockerfile installs ffmpeg).
+2) pip install -r requirements.txt  (aiogram v3, yt-dlp, python-dotenv)
+3) Create .env with: BOT_TOKEN=123456:ABC...
+4) Run:  python telegram_ytdlp_bot.py
 
 Commands
 --------
-/start                              — brief help
-/get <url> [video|audio] [360|480|720]  — download & send
+/start  — brief help
+/help   — inline guide
+/guide  — guide as HTML file
+/get <url> [video|audio] [360|480|720]
 /getall <channel_or_playlist_url> [video|audio] [360|480|720] [limit=ALL|N]
-Examples:
-  /get https://youtu.be/dQw4w9WgXcQ
-  /get https://youtu.be/dQw4w9WgXcQ audio
-  /get https://youtu.be/dQw4w9WgXcQ video 480
-  /getall https://www.youtube.com/@YourChannel/videos limit=ALL
-
-Notes on file sizes
--------------------
-• Using the public Bot API endpoint, Telegram accepts uploads up to ~50 MB for files you upload via multipart/form-data.
-• If you self‑host Telegram's Local Bot API Server, uploads up to 2 GB are allowed.
-• This bot tries to keep outputs ≤ 49 MB for reliability. If a video is larger, it will attempt a fast transcode to shrink it.
-
-Author: you + GPT
 """
 from __future__ import annotations
+
 import asyncio
 import os
 import shlex
@@ -44,23 +31,23 @@ from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message, FSInputFile
 from dotenv import load_dotenv
 import yt_dlp
 
-# ------------ config -------------
-TARGET_MB = 49  # aim to stay below typical Bot API upload limit
-DEFAULT_HEIGHT = 480
+# ---------------- configuration ----------------
+TARGET_MB = 49          # try to keep Telegram Bot API-friendly
+DEFAULT_HEIGHT = 480    # default max height for video
 ALLOWED_NETLOC = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
-# ---------------------------------
+# ------------------------------------------------
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise SystemExit("Please set BOT_TOKEN environment variable (e.g., via .env)")
+    raise SystemExit("Please set BOT_TOKEN environment variable (e.g., in .env).")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -69,28 +56,23 @@ GUIDE_TEXT = (
     """
 <b>YT-DLP Telegram Bot — Guide</b>
 
-<b>Что умеет</b>
-• /get &lt;url&gt; [video|audio] [360|480|720] — скачать одно видео/аудио
-• /getall &lt;channel_or_playlist_url&gt; [video|audio] [360|480|720] [limit=ALL|N] — скачать пачку
+<b>What it does</b>
+• /get &lt;url&gt; [video|audio] [360|480|720] — download single video or audio
+• /getall &lt;channel_or_playlist_url&gt; [video|audio] [360|480|720] [limit=ALL|N] — bulk from channel/playlist
 
-<b>Подсказки</b>
-• Для канала указывай URL со вкладкой /videos (пример: https://www.youtube.com/@YourChannel/videos)
-• Если файл большой, бот попробует ужать до ~49 MB. Для надёжности укажи “video 360”.
-• Загружай только контент, на который у тебя есть права.
+<b>Tips</b>
+• For channels use the /videos URL (e.g. https://www.youtube.com/@YourChannel/videos)
+• If a file is large, the bot will try to shrink to ~49 MB. For reliability use “video 360”.
+• Download only content you have rights to.
 
-<b>Лимиты Telegram</b>
-• Через публичный Bot API: отправка до ~50 MB на файл.
-• Через Local Bot API Server: до 2 GB.
+<b>Telegram limits</b>
+• Public Bot API uploads: ~50 MB per file.
+• Local Bot API Server: up to 2 GB.
 
-<b>Развёртывание в облаке</b>
-1) Dockerfile + requirements.txt в репозитории.
-2) Переменная окружения BOT_TOKEN.
-3) Запуск как Background Worker (Render/Railway/Fly.io) или как systemd‑сервис на VPS.
-
-<b>Команды</b>
-/start — краткая помощь
-/help — эта справка
-/guide — прислать справку файлом
+<b>Deploy</b>
+• Repo needs: telegram_ytdlp_bot.py, requirements.txt, Dockerfile.
+• Set BOT_TOKEN env var.
+• Run in Docker or any Python host (long-polling).
 """
 )
 
@@ -99,9 +81,9 @@ YTDLP_COMMON = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    # speed up networking a bit
     "concurrent_fragment_downloads": 5,
 }
+
 
 @dataclass
 class DLResult:
@@ -133,7 +115,10 @@ def sizeof_mb(path: Path) -> float:
 
 
 async def ffprobe_duration(path: Path) -> Optional[float]:
-    cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(str(path))}"
+    cmd = (
+        "ffprobe -v error -show_entries format=duration "
+        f"-of default=noprint_wrappers=1:nokey=1 {shlex.quote(str(path))}"
+    )
     code, out, _ = await run_cmd(cmd)
     if code == 0:
         try:
@@ -144,21 +129,22 @@ async def ffprobe_duration(path: Path) -> Optional[float]:
 
 
 async def shrink_video(in_path: Path, out_path: Path, target_mb: int = TARGET_MB, height: int = 360) -> bool:
-    """Transcode H.264 + AAC roughly targeting <= target_mb using simple bitrate math.
-    Returns True if out_path created.
     """
-    duration = await ffprobe_duration(in_path) or 0
+    Transcode H.264 + AAC roughly targeting <= target_mb using simple bitrate math.
+    Returns True if out_path created successfully.
+    """
+    duration = await ffprobe_duration(in_path) or 0.0
     if duration <= 0:
-        # fallback single-pass
+        # fallback single-pass CRF if duration is unknown
         cmd = (
             f"ffmpeg -y -i {shlex.quote(str(in_path))} -vf scale=-2:{height} "
-            f"-c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k -movflags +faststart {shlex.quote(str(out_path))}"
+            "-c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 96k "
+            f"-movflags +faststart {shlex.quote(str(out_path))}"
         )
         code, _, _ = await run_cmd(cmd)
         return code == 0 and out_path.exists()
 
     audio_kbps = 96
-    # bits budget
     target_bits = target_mb * 8 * 1024 * 1024
     vbps = max(300_000, int(target_bits / duration) - audio_kbps * 1000)
 
@@ -171,8 +157,11 @@ async def shrink_video(in_path: Path, out_path: Path, target_mb: int = TARGET_MB
     return code == 0 and out_path.exists()
 
 
-async def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLResult:
-    """Download using yt-dlp. mode: 'video' or 'audio'"""
+def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLResult:
+    """
+    Download using yt-dlp. mode: 'video' or 'audio'
+    (Runs in a thread via asyncio.to_thread)
+    """
     opts = dict(YTDLP_COMMON)
     opts["paths"] = {"home": str(workdir)}
 
@@ -190,25 +179,22 @@ async def ytdlp_download(url: str, mode: str, height: int, workdir: Path) -> DLR
                 "merge_output_format": None,
             }
         )
-    else:  # video
+    else:
         fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
-        opts.update(
-            {
-                "format": fmt,
-                "merge_output_format": "mp4",
-            }
-        )
+        opts.update({"format": fmt, "merge_output_format": "mp4"})
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        # Final path inference
         if "requested_downloads" in info and info["requested_downloads"]:
-            fn = Path(info["requested_downloads"][0]["filepath"])  # newer yt-dlp
+            fn = Path(info["requested_downloads"][0]["filepath"])
         else:
+            # fallback guess
             fn = Path(ydl.prepare_filename(info)).with_suffix(".mp3" if mode == "audio" else ".mp4")
         title = info.get("title", fn.stem)
         return DLResult(path=fn, title=title, ext=fn.suffix.lstrip("."))
 
+
+# -------------------- Telegram handlers --------------------
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -239,7 +225,7 @@ async def cmd_guide(message: Message):
         p.write_text(GUIDE_TEXT, encoding="utf-8")
         await message.answer_document(
             FSInputFile(str(p), filename="yt_dlp_bot_guide.html"),
-            caption="Справка к боту"
+            caption="Справка к боту",
         )
 
 
@@ -249,8 +235,8 @@ async def cmd_get(message: Message):
     if len(args) < 2:
         await message.reply("Дай ссылку на YouTube после /get")
         return
-    url = args[1].strip()
 
+    url = args[1].strip()
     if not is_youtube_url(url):
         await message.reply("Похоже, это не ссылка на YouTube.")
         return
@@ -267,7 +253,6 @@ async def cmd_get(message: Message):
     if len(args) >= 4 and args[3].isdigit():
         height = int(args[3])
 
-    # acknowledge
     await message.reply(f"Ок, качаю {mode}… это может занять минутку")
 
     with tempfile.TemporaryDirectory() as td:
@@ -279,7 +264,8 @@ async def cmd_get(message: Message):
             return
 
         out_path = dl.path
-        # If video and size is too big, try shrink
+
+        # shrink if needed
         try:
             if mode == "video" and sizeof_mb(out_path) > TARGET_MB:
                 smaller = workdir / f"{out_path.stem}.small.mp4"
@@ -289,42 +275,42 @@ async def cmd_get(message: Message):
         except Exception:
             pass
 
-        # Choose sending method
+        # send back
         try:
-            caption = f"{dl.title}
-(через yt-dlp)"
+            caption = "{}\n(через yt-dlp)".format(dl.title)
             file = FSInputFile(str(out_path))
             await message.answer_document(file, caption=caption)
         except Exception as e:
             size = sizeof_mb(out_path)
             msg = (
                 "Не удалось отправить файл. "
-                f"Размер: {size:.1f} MB. Попробуй /get <url> video 360 или аудио.
-"
+                f"Размер: {size:.1f} MB. Попробуй /get <url> video 360 или аудио.\n"
                 f"Тех. причина: {e}"
             )
             await message.reply(msg)
 
 
-# ---------- bulk channel/playlist download ----------
+# ------------- bulk channel/playlist support -------------
 
 def _normalize_watch_url(entry: dict) -> Optional[str]:
     url = entry.get("webpage_url") or entry.get("url") or ""
     if not url:
         return None
     if not url.startswith("http"):
-        # often yt-dlp returns bare IDs when extract_flat is used
         return f"https://www.youtube.com/watch?v={url}"
     return url
 
 
 def list_playlist_urls(url: str, limit: Optional[int] = None) -> list[str]:
-    """Return a list of watch URLs from a channel/playlist URL.
-    Uses yt-dlp in extract-only mode (no downloads)."""
+    """
+    Return a list of watch URLs from a channel/playlist URL.
+    Uses yt-dlp in extract-only mode (no downloads).
+    Runs sync (call via asyncio.to_thread).
+    """
     opts = dict(YTDLP_COMMON)
     opts.update({
-        "noplaylist": False,            # allow playlists/channels
-        "extract_flat": "in_playlist", # faster listing
+        "noplaylist": False,
+        "extract_flat": "in_playlist",
         "skip_download": True,
         "quiet": True,
         "no_warnings": True,
@@ -349,14 +335,11 @@ def list_playlist_urls(url: str, limit: Optional[int] = None) -> list[str]:
 
 @dp.message(Command("getall"))
 async def cmd_getall(message: Message):
-    """Download and send multiple videos from a channel/playlist.
+    """
+    Download and send multiple videos from a channel/playlist.
 
     Usage:
       /getall <channel_or_playlist_url> [video|audio] [360|480|720] [limit=ALL|N]
-
-    Notes:
-      • По умолчанию скачиваем первые 10, чтобы не заспамить чат. Укажи limit=ALL, чтобы взять все.
-      • Большие файлы бот попробует ужать до ~49 MB.
     """
     args = (message.text or "").split()
     if len(args) < 2:
@@ -372,7 +355,7 @@ async def cmd_getall(message: Message):
 
     mode = "video"
     height = DEFAULT_HEIGHT
-    limit: Optional[int] = 10  # по умолчанию берём первые 10
+    limit: Optional[int] = 10  # default to first 10
 
     for token in args[2:]:
         t = token.lower()
@@ -425,21 +408,23 @@ async def cmd_getall(message: Message):
                     pass
 
                 try:
-                    caption = f"{dl.title}
-(через yt-dlp)"
+                    caption = "{}\n(через yt-dlp)".format(dl.title)
                     file = FSInputFile(str(out_path))
                     await message.answer_document(file, caption=caption)
                     sent += 1
                     await note.edit_text(f"{idx}/{total} — готово ✅")
                 except Exception as e:
                     await note.edit_text(f"{idx}/{total} — не удалось отправить файл: {e}")
-            await asyncio.sleep(1.2)  # лёгкая пауза, чтобы не ловить лимиты
+
+            await asyncio.sleep(1.2)  # small pause to be gentle to limits
         except Exception:
-            # продолжаем следующий ролик даже если этот упал
+            # continue with next video even if this iteration failed
             continue
 
     await message.reply(f"Готово. Отправлено: {sent} из {total}.")
 
+
+# -------------------- entrypoint --------------------
 
 async def main():
     await dp.start_polling(bot)
