@@ -1,3 +1,4 @@
 aiogram>=3,<4
 yt-dlp>=2024.3
 python-dotenv>=1.0
+requests
